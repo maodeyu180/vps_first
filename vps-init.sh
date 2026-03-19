@@ -10,7 +10,9 @@
 #   4. 公钥格式校验, 防止粘贴错误
 #
 # 用法: 以 root 身份运行
-#   chmod +x vps-init.sh && sudo bash vps-init.sh
+#   chmod +x vps-init.sh
+#   bash vps-init.sh            # 已经是 root
+#   sudo bash vps-init.sh       # 普通用户通过 sudo 提权
 # =============================================================================
 set -euo pipefail
 
@@ -18,14 +20,40 @@ set -euo pipefail
 if [[ $EUID -ne 0 ]]; then
     echo -e "\033[0;31m[ERROR]\033[0m 此脚本必须以 root 身份运行!"
     echo ""
-    echo "  请使用以下方式之一:"
-    echo "    sudo bash $0"
-    echo "    su -c 'bash $0'"
-    echo ""
-    echo "  或先切换到 root:"
-    echo "    sudo -i"
-    echo "    bash $0"
+    if command -v sudo &>/dev/null; then
+        echo "  请使用以下方式之一:"
+        echo "    sudo bash $0"
+        echo "    sudo -i && bash $0"
+    else
+        echo "  当前系统未安装 sudo, 请先切换到 root:"
+        echo "    su - root"
+        echo "    bash $0"
+    fi
     exit 1
+fi
+
+# ========================== 确保 sudo 可用 (root 下预装) ==========================
+# 许多极简系统/容器镜像不带 sudo, 但后续创建的普通用户需要它
+if ! command -v sudo &>/dev/null; then
+    echo -e "\033[0;34m[INFO]\033[0m 检测到 sudo 未安装, 正在预装..."
+    if command -v apt-get &>/dev/null; then
+        apt-get update -qq && apt-get install -y -qq sudo >/dev/null 2>&1
+    elif command -v yum &>/dev/null; then
+        yum install -y -q sudo >/dev/null 2>&1
+    elif command -v dnf &>/dev/null; then
+        dnf install -y -q sudo >/dev/null 2>&1
+    elif command -v pacman &>/dev/null; then
+        pacman -Sy --noconfirm sudo >/dev/null 2>&1
+    elif command -v apk &>/dev/null; then
+        apk add --no-cache sudo >/dev/null 2>&1
+    elif command -v zypper &>/dev/null; then
+        zypper install -y sudo >/dev/null 2>&1
+    fi
+    if command -v sudo &>/dev/null; then
+        echo -e "\033[0;32m[OK]\033[0m sudo 安装成功"
+    else
+        echo -e "\033[1;33m[WARN]\033[0m sudo 安装失败, 新用户可能无法使用 sudo 提权"
+    fi
 fi
 
 # ========================== 默认配置 ==========================
