@@ -978,19 +978,27 @@ phase4_ssh_harden() {
 
     # --- 端口 ---
     echo ""
-    info "当前 SSH 端口: $(get_current_ssh_port)"
-    local new_port
-    read -rp "$(echo -e "${CYAN}请输入新的 SSH 端口 [默认: $DEFAULT_SSH_PORT, 输入 'skip' 保持不变]: ${NC}")" new_port
+    local current_port
+    current_port=$(get_current_ssh_port)
+    info "当前 SSH 端口: $current_port"
+    echo ""
+    warn "注意: 部分云厂商 (阿里云/腾讯云/AWS 等) 的防火墙/安全组在控制台配置,"
+    warn "系统内改端口后还需要去厂商控制台放行对应端口, 否则会连不上。"
+    warn "轻量服务器的 SSH 可能由平台代理, 改端口不生效。"
+    warn "如果不确定, 建议保持默认端口不变。"
+    echo ""
 
-    if [[ "$new_port" == "skip" ]]; then
-        new_port=$(get_current_ssh_port)
-        info "保持当前端口: $new_port"
-    else
+    local new_port
+    if confirm "是否修改 SSH 端口?" "n"; then
+        read -rp "$(echo -e "${CYAN}请输入新的 SSH 端口 (1024-65535) [默认: $DEFAULT_SSH_PORT]: ${NC}")" new_port
         new_port="${new_port:-$DEFAULT_SSH_PORT}"
         if ! validate_port "$new_port"; then
-            warn "端口不合法 (需要 1024-65535), 使用默认值 $DEFAULT_SSH_PORT"
-            new_port="$DEFAULT_SSH_PORT"
+            warn "端口不合法 (需要 1024-65535), 保持当前端口: $current_port"
+            new_port="$current_port"
         fi
+    else
+        new_port="$current_port"
+        info "保持当前端口: $new_port"
     fi
     NEW_SSH_PORT="$new_port"
 
