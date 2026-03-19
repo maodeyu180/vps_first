@@ -1,4 +1,4 @@
-# VPS First — 新 VPS 到手后的第一个脚本
+# VPS First —  VPS 到手后的第一个脚本
 
 > 新买的 VPS 就像一扇没上锁的门，全世界的脚本小子都在敲。这个脚本帮你把门锁好。
 
@@ -9,6 +9,7 @@
 - **多发行版兼容** — Debian/Ubuntu、CentOS/RHEL/Fedora/AlmaLinux/Rocky、Arch、Alpine、openSUSE
 - **防锁定设计** — 禁用密码登录前强制验证密钥登录，SSH 配置修改失败自动回滚
 - **公钥格式校验** — 粘贴公钥时自动验证格式，防止无效密钥写入
+- **EOL 源自动修复** — CentOS/Debian/Ubuntu/Fedora EOL 后自动切换到对应归档源
 - **SELinux 自适应** — CentOS/RHEL 修改端口时自动处理 SELinux 策略
 - **防火墙自动选择** — 根据系统自动使用 ufw / firewalld / iptables
 - **全程可交互** — 每个步骤都可确认或跳过，不会强制执行

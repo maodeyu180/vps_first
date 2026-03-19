@@ -567,9 +567,160 @@ phase0_precheck() {
     fi
 }
 
+# ========================== EOL 源修复 ==========================
+# 各发行版 EOL 后官方镜像下线, 需要切换到归档源才能安装软件包
+# CentOS 7/8 → vault.centos.org
+# Debian ≤10  → archive.debian.org
+# Ubuntu EOL  → old-releases.ubuntu.com
+# Fedora EOL  → archives.fedoraproject.org
+
+_check_url_reachable() {
+    local url="$1"
+    if command -v curl &>/dev/null; then
+        curl -sfL --head --max-time 10 "$url" >/dev/null 2>&1
+    elif command -v wget &>/dev/null; then
+        wget -q --spider --timeout=10 "$url" 2>/dev/null
+    else
+        return 0
+    fi
+}
+
+_fix_centos_eol() {
+    local vault_base="http://vault.centos.org"
+    local needs_fix=false
+
+    if [[ "$OS_VERSION" == "7" || "$OS_VERSION" == "8" ]]; then
+        for repo in /etc/yum.repos.d/CentOS-*.repo; do
+            [[ -f "$repo" ]] || continue
+            if grep -qE '^\s*mirrorlist=' "$repo" 2>/dev/null; then
+                needs_fix=true
+                break
+            fi
+        done
+    else
+        return 0
+    fi
+
+    $needs_fix || return 0
+
+    warn "CentOS $OS_VERSION 已 EOL, 官方镜像已下线"
+    info "将 yum 源切换到 vault.centos.org..."
+
+    for repo in /etc/yum.repos.d/CentOS-*.repo; do
+        [[ -f "$repo" ]] || continue
+        cp "$repo" "${repo}.bak.$(date +%s)" 2>/dev/null || true
+        sed -i 's|^\s*mirrorlist=|#mirrorlist=|g' "$repo"
+        if [[ "$OS_VERSION" == "7" ]]; then
+            sed -i 's|^#\s*baseurl=http://mirror.centos.org/centos|baseurl='"$vault_base"'/centos|g' "$repo"
+            sed -i 's|^baseurl=http://mirror.centos.org/centos|baseurl='"$vault_base"'/centos|g' "$repo"
+        else
+            sed -i 's|^#\s*baseurl=http://mirror.centos.org|baseurl='"$vault_base"'/centos|g' "$repo"
+            sed -i 's|^baseurl=http://mirror.centos.org|baseurl='"$vault_base"'/centos|g' "$repo"
+        fi
+    done
+
+    yum clean all &>/dev/null || true
+    success "yum 源已切换到 vault.centos.org"
+}
+
+_fix_debian_eol() {
+    [[ "$OS_VERSION" -ge 11 ]] && return 0
+
+    grep -q "archive.debian.org" /etc/apt/sources.list 2>/dev/null && return 0
+
+    local codename
+    codename=$(. /etc/os-release && echo "${VERSION_CODENAME:-}")
+    [[ -z "$codename" ]] && return 0
+
+    if _check_url_reachable "http://deb.debian.org/debian/dists/${codename}/Release"; then
+        return 0
+    fi
+
+    warn "Debian $OS_VERSION ($codename) 已 EOL, 常规镜像已下线"
+    info "将 apt 源切换到 archive.debian.org..."
+
+    cp /etc/apt/sources.list "/etc/apt/sources.list.bak.$(date +%s)" 2>/dev/null || true
+    sed -i -E 's|https?://[a-zA-Z0-9.\-]+/debian/?|http://archive.debian.org/debian/|g' /etc/apt/sources.list
+    sed -i -E 's|https?://security\.debian\.org[^ ]*|http://archive.debian.org/debian-security/|g' /etc/apt/sources.list
+
+    echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99no-check-valid-until
+    apt-get clean 2>/dev/null || true
+    success "apt 源已切换到 archive.debian.org"
+}
+
+_fix_ubuntu_eol() {
+    grep -q "old-releases.ubuntu.com" /etc/apt/sources.list 2>/dev/null && return 0
+
+    local codename
+    codename=$(. /etc/os-release && echo "${VERSION_CODENAME:-}")
+    [[ -z "$codename" ]] && return 0
+
+    if _check_url_reachable "http://archive.ubuntu.com/ubuntu/dists/${codename}/Release"; then
+        return 0
+    fi
+
+    if ! _check_url_reachable "http://old-releases.ubuntu.com/ubuntu/dists/${codename}/Release"; then
+        return 0
+    fi
+
+    warn "Ubuntu ($codename) 已 EOL, 常规镜像已下线"
+    info "将 apt 源切换到 old-releases.ubuntu.com..."
+
+    cp /etc/apt/sources.list "/etc/apt/sources.list.bak.$(date +%s)" 2>/dev/null || true
+    sed -i -E 's|https?://[a-zA-Z0-9.\-]+/ubuntu/?|http://old-releases.ubuntu.com/ubuntu/|g' /etc/apt/sources.list
+    sed -i -E 's|https?://security\.ubuntu\.com/ubuntu/?|http://old-releases.ubuntu.com/ubuntu/|g' /etc/apt/sources.list
+
+    apt-get clean 2>/dev/null || true
+    success "apt 源已切换到 old-releases.ubuntu.com"
+}
+
+_fix_fedora_eol() {
+    local release
+    release=$(rpm -E %fedora 2>/dev/null || echo "$OS_VERSION")
+
+    if _check_url_reachable "https://mirrors.fedoraproject.org/metalink?repo=fedora-${release}&arch=$(uname -m)"; then
+        return 0
+    fi
+
+    local has_metalink=false
+    for repo in /etc/yum.repos.d/fedora*.repo; do
+        [[ -f "$repo" ]] || continue
+        if grep -qE '^\s*metalink=' "$repo" 2>/dev/null; then
+            has_metalink=true
+            break
+        fi
+    done
+    $has_metalink || return 0
+
+    warn "Fedora $release 已 EOL, 标准镜像已下线"
+    info "将 dnf 源切换到 archives.fedoraproject.org..."
+
+    for repo in /etc/yum.repos.d/fedora*.repo; do
+        [[ -f "$repo" ]] || continue
+        cp "$repo" "${repo}.bak.$(date +%s)" 2>/dev/null || true
+        sed -i 's|^\s*metalink=|#metalink=|g' "$repo"
+        sed -i 's|^#baseurl=http://download.example/pub/fedora/linux|baseurl=https://archives.fedoraproject.org/pub/archive/fedora/linux|g' "$repo"
+    done
+
+    dnf clean all &>/dev/null || true
+    success "dnf 源已切换到 archives.fedoraproject.org"
+}
+
+fix_eol_repos() {
+    case "$OS_ID" in
+        centos)  _fix_centos_eol ;;
+        debian)  _fix_debian_eol ;;
+        ubuntu)  _fix_ubuntu_eol ;;
+        fedora)  _fix_fedora_eol ;;
+    esac
+}
+
 # ========================== 阶段 1: 系统更新与工具安装 ==========================
 phase1_system_update() {
     step "阶段 1/7: 系统更新与基础工具安装"
+
+    # --- EOL 源修复 (必须在任何包操作之前) ---
+    fix_eol_repos
 
     # --- EPEL 源 (RHEL 家族需要) ---
     if [[ "$OS_FAMILY" == "rhel" ]] && [[ "$OS_ID" != "fedora" ]]; then
