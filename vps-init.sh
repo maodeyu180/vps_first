@@ -14,6 +14,20 @@
 # =============================================================================
 set -euo pipefail
 
+# ========================== Root 权限检查 (最早执行) ==========================
+if [[ $EUID -ne 0 ]]; then
+    echo -e "\033[0;31m[ERROR]\033[0m 此脚本必须以 root 身份运行!"
+    echo ""
+    echo "  请使用以下方式之一:"
+    echo "    sudo bash $0"
+    echo "    su -c 'bash $0'"
+    echo ""
+    echo "  或先切换到 root:"
+    echo "    sudo -i"
+    echo "    bash $0"
+    exit 1
+fi
+
 # ========================== 默认配置 ==========================
 DEFAULT_USER="deploy"
 DEFAULT_SSH_PORT="22000"
@@ -525,12 +539,6 @@ APT::Periodic::Unattended-Upgrade "1";' > /etc/apt/apt.conf.d/20auto-upgrades
 phase0_precheck() {
     step "阶段 0/7: 前置检查"
 
-    if [[ $EUID -ne 0 ]]; then
-        error "此脚本需要 root 权限运行"
-        error "请使用: sudo bash $0"
-        exit 1
-    fi
-
     detect_os
 
     info "系统信息:"
@@ -785,7 +793,17 @@ phase1_system_update() {
 
 # ========================== 阶段 2: 创建非 root 用户 ==========================
 phase2_create_user() {
-    step "阶段 2/7: 创建非 root 用户"
+    step "阶段 2/7: 用户配置"
+
+    echo "创建独立用户可以避免日常操作使用 root, 提高安全性。"
+    echo "如果你习惯直接用 root, 也可以跳过。"
+    echo ""
+
+    if ! confirm "是否创建新的非 root 用户?" "n"; then
+        info "跳过用户创建, 将继续使用 root"
+        NEW_USER=""
+        return 0
+    fi
 
     local username
     read -rp "$(echo -e "${CYAN}请输入新用户名 [默认: $DEFAULT_USER]: ${NC}")" username
@@ -798,7 +816,7 @@ phase2_create_user() {
 
     if id "$username" &>/dev/null; then
         warn "用户 '$username' 已存在"
-        if confirm "是否跳过用户创建, 继续使用该用户?"; then
+        if confirm "是否直接使用该用户继续?"; then
             NEW_USER="$username"
             usermod -aG "$SUDO_GROUP" "$username" 2>/dev/null || true
             success "将使用已有用户: $username (已确保在 $SUDO_GROUP 组)"
@@ -868,7 +886,7 @@ phase3_ssh_key() {
                 info "请重新输入"
             fi
         else
-            (( attempts++ ))
+            attempts=$((attempts + 1))
             error "公钥格式不正确! (尝试 $attempts/$max_attempts)"
             echo "公钥应该类似:"
             echo "  ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... user@host"
@@ -888,8 +906,9 @@ phase3_ssh_key() {
     fi
 
     # 安装公钥
+    local target_user="${NEW_USER:-root}"
     local user_home
-    user_home=$(eval echo "~${NEW_USER}")
+    user_home=$(eval echo "~${target_user}")
     local ssh_dir="$user_home/.ssh"
     local auth_keys="$ssh_dir/authorized_keys"
 
@@ -904,7 +923,7 @@ phase3_ssh_key() {
     fi
 
     chmod 600 "$auth_keys"
-    chown -R "${NEW_USER}:${NEW_USER}" "$ssh_dir"
+    chown -R "${target_user}:${target_user}" "$ssh_dir"
 
     # SELinux: 修复上下文
     if command -v restorecon &>/dev/null; then
@@ -923,7 +942,7 @@ phase3_ssh_key() {
     server_ip=$(get_server_ip)
     local current_port
     current_port=$(get_current_ssh_port)
-    echo -e "  ${CYAN}ssh -p $current_port ${NEW_USER}@${server_ip}${NC}"
+    echo -e "  ${CYAN}ssh -p $current_port ${NEW_USER:-root}@${server_ip}${NC}"
     echo ""
     echo -e "${YELLOW}请确认: 不需要输入 服务器密码 就能登录成功${NC}"
     echo -e "${YELLOW}(如果给私钥设了 passphrase, 会提示输入私钥密码, 这是正常的)${NC}"
@@ -994,12 +1013,18 @@ phase4_ssh_harden() {
     }
 
     apply_setting "Port" "$NEW_SSH_PORT" "$tmp_config"
-    apply_setting "PermitRootLogin" "no" "$tmp_config"
     apply_setting "PubkeyAuthentication" "yes" "$tmp_config"
     apply_setting "MaxAuthTries" "3" "$tmp_config"
-    apply_setting "ClientAliveInterval" "300" "$tmp_config"
+    apply_setting "ClientAliveInterval" "3600" "$tmp_config"
     apply_setting "ClientAliveCountMax" "2" "$tmp_config"
     apply_setting "PermitEmptyPasswords" "no" "$tmp_config"
+
+    # Root 登录: 有独立用户时禁止, 否则保留
+    local root_login_setting="yes"
+    if [[ -n "${NEW_USER:-}" ]]; then
+        root_login_setting="no"
+    fi
+    apply_setting "PermitRootLogin" "$root_login_setting" "$tmp_config"
 
     if [[ "$SSH_KEY_CONFIGURED" == true ]]; then
         apply_setting "PasswordAuthentication" "no" "$tmp_config"
@@ -1013,11 +1038,15 @@ phase4_ssh_harden() {
     echo ""
     info "SSH 配置变更摘要:"
     echo "  端口:            $(get_current_ssh_port) -> $NEW_SSH_PORT"
-    echo "  Root 登录:       -> 禁止"
+    if [[ -n "${NEW_USER:-}" ]]; then
+        echo "  Root 登录:       -> 禁止"
+    else
+        echo "  Root 登录:       -> 保持允许 (未创建独立用户)"
+    fi
     echo "  公钥认证:        -> 开启"
     echo "  密码登录:        -> $(if [[ "$SSH_KEY_CONFIGURED" == true ]]; then echo '禁用'; else echo '保持开启(安全起见)'; fi)"
     echo "  最大认证尝试:    -> 3 次"
-    echo "  客户端超时:      -> 300s x 2"
+    echo "  客户端超时:      -> 3600s x 2 (2小时)"
     if command -v getenforce &>/dev/null && [[ "$(getenforce 2>/dev/null)" == "Enforcing" ]] && [[ "$NEW_SSH_PORT" != "22" ]]; then
         echo "  SELinux 端口注册: -> $NEW_SSH_PORT"
     fi
@@ -1058,7 +1087,7 @@ phase4_ssh_harden() {
     echo ""
     local server_ip
     server_ip=$(get_server_ip)
-    echo -e "  ${CYAN}ssh -p $NEW_SSH_PORT ${NEW_USER}@${server_ip}${NC}"
+    echo -e "  ${CYAN}ssh -p $NEW_SSH_PORT ${NEW_USER:-root}@${server_ip}${NC}"
     if [[ "$SSH_KEY_CONFIGURED" != true ]]; then
         echo "  (需要输入用户密码)"
     fi
@@ -1587,128 +1616,117 @@ phase7_summary() {
     echo -e "${BOLD}===== 系统检查清单 =====${NC}"
     echo ""
 
+    _check_item() {
+        local status="$1" label="$2"
+        checks_total=$((checks_total + 1))
+        if [[ "$status" == "ok" ]]; then
+            echo -e "  ${GREEN}✓${NC} $label"
+            checks_passed=$((checks_passed + 1))
+        elif [[ "$status" == "warn" ]]; then
+            echo -e "  ${YELLOW}△${NC} $label"
+        else
+            echo -e "  ${RED}✗${NC} $label"
+        fi
+    }
+
     # 1. 主机名
-    (( checks_total++ ))
     local cur_hostname
     cur_hostname=$(hostname)
-    echo -e "  ${GREEN}✓${NC} 主机名: $cur_hostname"
-    (( checks_passed++ ))
+    _check_item "ok" "主机名: $cur_hostname"
 
     # 2. 非 root 用户
-    (( checks_total++ ))
-    if id "${NEW_USER:-}" &>/dev/null; then
-        echo -e "  ${GREEN}✓${NC} 用户 '${NEW_USER}' (${SUDO_GROUP} 组)"
-        (( checks_passed++ ))
+    if [[ -n "${NEW_USER:-}" ]] && id "${NEW_USER}" &>/dev/null; then
+        _check_item "ok" "用户 '${NEW_USER}' (${SUDO_GROUP} 组)"
+    elif [[ -z "${NEW_USER:-}" ]]; then
+        _check_item "warn" "使用 root 登录 (未创建独立用户)"
     else
-        echo -e "  ${RED}✗${NC} 未创建非 root 用户"
+        _check_item "fail" "未创建非 root 用户"
     fi
 
     # 3. SSH 密钥
-    (( checks_total++ ))
     local user_home
     user_home=$(eval echo "~${NEW_USER:-root}")
     local auth_file="$user_home/.ssh/authorized_keys"
     if [ -f "$auth_file" ] && [ -s "$auth_file" ]; then
-        echo -e "  ${GREEN}✓${NC} SSH 公钥已配置"
-        (( checks_passed++ ))
+        _check_item "ok" "SSH 公钥已配置"
     else
-        echo -e "  ${RED}✗${NC} SSH 公钥未配置"
+        _check_item "fail" "SSH 公钥未配置"
     fi
 
     # 4. 密码登录状态
-    (( checks_total++ ))
     local pass_auth
     pass_auth=$(grep -E '^[ \t]*PasswordAuthentication[ \t]+' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | tail -1)
     if [[ "$pass_auth" == "no" ]]; then
-        echo -e "  ${GREEN}✓${NC} 密码登录已禁用"
-        (( checks_passed++ ))
+        _check_item "ok" "密码登录已禁用"
     else
-        echo -e "  ${YELLOW}△${NC} 密码登录仍开启$(if [[ "$SSH_KEY_CONFIGURED" != true ]]; then echo ' (密钥未验证, 安全保留)'; fi)"
+        _check_item "warn" "密码登录仍开启$(if [[ "$SSH_KEY_CONFIGURED" != true ]]; then echo ' (密钥未验证, 安全保留)'; fi)"
     fi
 
     # 5. Root 登录
-    (( checks_total++ ))
     local root_login
     root_login=$(grep -E '^[ \t]*PermitRootLogin[ \t]+' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | tail -1)
     if [[ "$root_login" == "no" ]]; then
-        echo -e "  ${GREEN}✓${NC} Root SSH 已禁止"
-        (( checks_passed++ ))
+        _check_item "ok" "Root SSH 已禁止"
     else
-        echo -e "  ${YELLOW}△${NC} Root SSH 仍然允许"
+        _check_item "warn" "Root SSH 仍然允许"
     fi
 
     # 6. SSH 端口
-    (( checks_total++ ))
     local ssh_port
     ssh_port=$(get_current_ssh_port)
-    echo -e "  ${GREEN}✓${NC} SSH 端口: $ssh_port"
-    (( checks_passed++ ))
+    _check_item "ok" "SSH 端口: $ssh_port"
 
     # 7. Swap
-    (( checks_total++ ))
     local swap_total
     swap_total=$(free -m | awk '/^Swap:/{print $2}')
     if (( swap_total > 0 )); then
-        echo -e "  ${GREEN}✓${NC} Swap: ${swap_total}MB"
-        (( checks_passed++ ))
+        _check_item "ok" "Swap: ${swap_total}MB"
     else
-        echo -e "  ${YELLOW}△${NC} Swap 未配置"
+        _check_item "warn" "Swap 未配置"
     fi
 
     # 8. 防火墙
-    (( checks_total++ ))
     if fw_is_active; then
-        echo -e "  ${GREEN}✓${NC} 防火墙已启用 ($FW_TYPE)"
-        (( checks_passed++ ))
+        _check_item "ok" "防火墙已启用 ($FW_TYPE)"
     else
-        echo -e "  ${YELLOW}△${NC} 防火墙未启用"
+        _check_item "warn" "防火墙未启用"
     fi
 
     # 9. BBR
-    (( checks_total++ ))
     local bbr_status
     bbr_status=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
     if [[ "$bbr_status" == "bbr" ]]; then
-        echo -e "  ${GREEN}✓${NC} BBR 加速已开启"
-        (( checks_passed++ ))
+        _check_item "ok" "BBR 加速已开启"
     else
-        echo -e "  ${YELLOW}△${NC} BBR 未开启 (当前: $bbr_status)"
+        _check_item "warn" "BBR 未开启 (当前: $bbr_status)"
     fi
 
     # 10. fail2ban
-    (( checks_total++ ))
     if systemctl is-active fail2ban &>/dev/null || service fail2ban status &>/dev/null 2>&1; then
-        echo -e "  ${GREEN}✓${NC} fail2ban 运行中"
-        (( checks_passed++ ))
+        _check_item "ok" "fail2ban 运行中"
     else
-        echo -e "  ${YELLOW}△${NC} fail2ban 未运行"
+        _check_item "warn" "fail2ban 未运行"
     fi
 
     # 11. 时区
-    (( checks_total++ ))
     local tz
     tz=$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo "unknown")
-    echo -e "  ${GREEN}✓${NC} 时区: $tz"
-    (( checks_passed++ ))
+    _check_item "ok" "时区: $tz"
 
     # 12. Locale
-    (( checks_total++ ))
     local cur_lang
     cur_lang=$(echo "${LANG:-$(locale 2>/dev/null | grep ^LANG= | cut -d= -f2)}")
     if [[ "$cur_lang" == *"UTF-8"* ]] || [[ "$cur_lang" == *"utf8"* ]]; then
-        echo -e "  ${GREEN}✓${NC} Locale: $cur_lang"
-        (( checks_passed++ ))
+        _check_item "ok" "Locale: $cur_lang"
     else
-        echo -e "  ${YELLOW}△${NC} Locale: ${cur_lang:-未设置} (非 UTF-8)"
+        _check_item "warn" "Locale: ${cur_lang:-未设置} (非 UTF-8)"
     fi
 
     # 13. 命令历史
-    (( checks_total++ ))
     if [ -f /etc/profile.d/history-enhance.sh ]; then
-        echo -e "  ${GREEN}✓${NC} 命令历史增强已配置"
-        (( checks_passed++ ))
+        _check_item "ok" "命令历史增强已配置"
     else
-        echo -e "  ${YELLOW}△${NC} 命令历史增强未配置"
+        _check_item "warn" "命令历史增强未配置"
     fi
 
     echo ""
@@ -1820,7 +1838,7 @@ main() {
     echo ""
     echo "  执行步骤:"
     echo "    1. 系统更新与工具安装"
-    echo "    2. 创建非 root 用户"
+    echo "    2. 用户配置 (可选创建非 root 用户)"
     echo "    3. SSH 密钥配置 (含验证)"
     echo "    4. SSH 安全加固 (含回滚)"
     echo "    5. 防火墙配置 (ufw/firewalld/iptables 自动选择)"
@@ -1843,8 +1861,8 @@ main() {
     phase4_ssh_harden
     phase5_firewall
     phase6_extras
-    phase7_summary
     phase_bonus_ssh_hello
+    phase7_summary
 }
 
 main "$@"
