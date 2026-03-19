@@ -39,16 +39,18 @@
 
 ### 一键运行（推荐）
 
+> **注意：** 请以 root 身份登录后执行。新 VPS 首次登录通常就是 root，直接粘贴即可。
+
 **海外服务器：**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/maodeyu180/vps_first/main/vps-init.sh -o vps-init.sh && sudo bash vps-init.sh
+curl -fsSL https://raw.githubusercontent.com/maodeyu180/vps_first/main/vps-init.sh -o vps-init.sh && bash vps-init.sh
 ```
 
 **国内服务器：**
 
 ```bash
-curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/maodeyu180/vps_first/main/vps-init.sh -o vps-init.sh && sudo bash vps-init.sh
+curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/maodeyu180/vps_first/main/vps-init.sh -o vps-init.sh && bash vps-init.sh
 ```
 
 ### 手动下载运行
@@ -60,8 +62,9 @@ wget https://raw.githubusercontent.com/maodeyu180/vps_first/main/vps-init.sh
 # 添加执行权限
 chmod +x vps-init.sh
 
-# 以 root 身份运行
-sudo bash vps-init.sh
+# 以 root 身份运行（二选一）
+bash vps-init.sh          # 已经是 root
+sudo bash vps-init.sh     # 普通用户通过 sudo 提权
 ```
 
 ## 运行前准备
