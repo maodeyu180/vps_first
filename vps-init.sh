@@ -149,8 +149,15 @@ detect_os() {
             SUDO_GROUP="sudo"
             SSH_SERVICE="ssh"
             FW_TYPE="ufw"
-            F2B_LOGPATH="/var/log/auth.log"
-            F2B_BACKEND="auto"
+            # Debian 12 / Ubuntu 24.04+ 默认不再生成 /var/log/auth.log
+            # (rsyslog 不再默认安装, 日志只写入 systemd journal)
+            if [[ -f /var/log/auth.log ]]; then
+                F2B_LOGPATH="/var/log/auth.log"
+                F2B_BACKEND="auto"
+            else
+                F2B_LOGPATH=""
+                F2B_BACKEND="systemd"
+            fi
             ;;
         centos|rhel|almalinux|rocky|ol|scientific)
             OS_FAMILY="rhel"
@@ -1373,6 +1380,28 @@ phase6_extras() {
         read -rp "$(echo -e "${CYAN}检测窗口(秒) [默认: 600 即10分钟]: ${NC}")" f2b_findtime
         f2b_findtime="${f2b_findtime:-600}"
 
+        # 实时探测 SSH 日志后端(Debian 12/Ubuntu 24.04+ 默认不再生成 /var/log/auth.log,
+        # 日志已完全迁移到 systemd-journald, 必须改用 backend=systemd)
+        local f2b_backend="$F2B_BACKEND"
+        local f2b_logpath="$F2B_LOGPATH"
+        if [[ "$f2b_logpath" == "/var/log/auth.log" && ! -f /var/log/auth.log ]]; then
+            if command -v journalctl &>/dev/null; then
+                info "未检测到 /var/log/auth.log, 改用 systemd journal"
+                f2b_backend="systemd"
+                f2b_logpath=""
+            fi
+        elif [[ "$f2b_logpath" == "/var/log/secure" && ! -f /var/log/secure ]]; then
+            info "未检测到 /var/log/secure, 改用 systemd journal"
+            f2b_backend="systemd"
+            f2b_logpath=""
+        fi
+
+        # backend=systemd 时 logpath 必须为空(或不写), 否则 fail2ban 会尝试打开不存在的文件
+        local logpath_line=""
+        if [[ -n "$f2b_logpath" ]]; then
+            logpath_line="logpath  = $f2b_logpath"
+        fi
+
         cat > "$jail_local" <<JAILEOF
 [DEFAULT]
 bantime  = $f2b_bantime
@@ -1383,8 +1412,8 @@ maxretry = $f2b_maxretry
 enabled  = true
 port     = $NEW_SSH_PORT
 filter   = sshd
-backend  = $F2B_BACKEND
-logpath  = $F2B_LOGPATH
+backend  = $f2b_backend
+$logpath_line
 maxretry = $f2b_maxretry
 bantime  = $f2b_bantime
 findtime = $f2b_findtime
@@ -1392,8 +1421,15 @@ JAILEOF
 
         systemctl restart fail2ban 2>/dev/null || service fail2ban restart 2>/dev/null || rc-service fail2ban restart 2>/dev/null
         systemctl enable fail2ban 2>/dev/null || true
-        success "fail2ban 已配置并启动"
-        fail2ban-client status sshd 2>/dev/null || true
+
+        # 等一会再检查是否启动成功, 失败时给出诊断
+        sleep 1
+        if systemctl is-active fail2ban &>/dev/null || service fail2ban status &>/dev/null 2>&1; then
+            success "fail2ban 已配置并启动 (backend=$f2b_backend)"
+            fail2ban-client status sshd 2>/dev/null || true
+        else
+            error "fail2ban 启动失败, 请运行 'systemctl status fail2ban' 和 'journalctl -u fail2ban -n 50' 查看详情"
+        fi
     fi
 
     # ======================================================================
