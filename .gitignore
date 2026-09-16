@@ -1,0 +1,8 @@
+# Local-only regression tests and test infrastructure
+/tests/
+/.github/workflows/check.yml
+/.dockerignore
+
+# Python test caches
+__pycache__/
+*.py[cod]

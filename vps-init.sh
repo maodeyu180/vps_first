@@ -14,47 +14,7 @@
 #   bash vps-init.sh            # 已经是 root
 #   sudo bash vps-init.sh       # 普通用户通过 sudo 提权
 # =============================================================================
-set -euo pipefail
-
-# ========================== Root 权限检查 (最早执行) ==========================
-if [[ $EUID -ne 0 ]]; then
-    echo -e "\033[0;31m[ERROR]\033[0m 此脚本必须以 root 身份运行!"
-    echo ""
-    if command -v sudo &>/dev/null; then
-        echo "  请使用以下方式之一:"
-        echo "    sudo bash $0"
-        echo "    sudo -i && bash $0"
-    else
-        echo "  当前系统未安装 sudo, 请先切换到 root:"
-        echo "    su - root"
-        echo "    bash $0"
-    fi
-    exit 1
-fi
-
-# ========================== 确保 sudo 可用 (root 下预装) ==========================
-# 许多极简系统/容器镜像不带 sudo, 但后续创建的普通用户需要它
-if ! command -v sudo &>/dev/null; then
-    echo -e "\033[0;34m[INFO]\033[0m 检测到 sudo 未安装, 正在预装..."
-    if command -v apt-get &>/dev/null; then
-        apt-get update -qq && apt-get install -y -qq sudo >/dev/null 2>&1
-    elif command -v yum &>/dev/null; then
-        yum install -y -q sudo >/dev/null 2>&1
-    elif command -v dnf &>/dev/null; then
-        dnf install -y -q sudo >/dev/null 2>&1
-    elif command -v pacman &>/dev/null; then
-        pacman -Sy --noconfirm sudo >/dev/null 2>&1
-    elif command -v apk &>/dev/null; then
-        apk add --no-cache sudo >/dev/null 2>&1
-    elif command -v zypper &>/dev/null; then
-        zypper install -y sudo >/dev/null 2>&1
-    fi
-    if command -v sudo &>/dev/null; then
-        echo -e "\033[0;32m[OK]\033[0m sudo 安装成功"
-    else
-        echo -e "\033[1;33m[WARN]\033[0m sudo 安装失败, 新用户可能无法使用 sudo 提权"
-    fi
-fi
+# source 时只加载函数, 供隔离测试使用; 权限/平台检查在 main 中执行。
 
 # ========================== 默认配置 ==========================
 DEFAULT_USER="deploy"
@@ -81,6 +41,11 @@ step()    { echo -e "\n${BOLD}${CYAN}========== $* ==========${NC}\n"; }
 NEW_USER=""
 NEW_SSH_PORT=""
 SSH_KEY_CONFIGURED=false
+SUDO_VERIFIED=false
+SSHD_CONFIG="/etc/ssh/sshd_config"
+ROLLBACK_DIR=""
+ROLLBACK_SECONDS=180
+FW_ZONES=()
 
 # 由 detect_os 填充
 OS_FAMILY=""        # debian | rhel | arch | suse | alpine
@@ -98,37 +63,70 @@ confirm() {
     local default="${2:-y}"
     local answer
     if [[ "$default" == "y" ]]; then
-        read -rp "$(echo -e "${YELLOW}$prompt [Y/n]: ${NC}")" answer
+        read -rp "$(echo -e "${YELLOW}$prompt [Y/n]: ${NC}")" answer || return 1
         answer="${answer:-y}"
     else
-        read -rp "$(echo -e "${YELLOW}$prompt [y/N]: ${NC}")" answer
+        read -rp "$(echo -e "${YELLOW}$prompt [y/N]: ${NC}")" answer || return 1
         answer="${answer:-n}"
     fi
     [[ "${answer,,}" == "y" ]]
 }
 
 get_server_ip() {
-    curl -s --max-time 5 ifconfig.me 2>/dev/null \
-        || curl -s --max-time 5 icanhazip.com 2>/dev/null \
-        || wget -qO- --timeout=5 ifconfig.me 2>/dev/null \
+    local _client_ip _client_port server_ip server_port
+    if [[ -n "${SSH_CONNECTION:-}" ]]; then
+        read -r _client_ip _client_port server_ip server_port <<< "$SSH_CONNECTION"
+        printf '%s\n' "$server_ip"
+        return
+    fi
+    curl -fsS --max-time 5 https://ifconfig.me/ip 2>/dev/null \
+        || curl -fsS --max-time 5 https://icanhazip.com 2>/dev/null \
+        || wget -qO- --timeout=5 https://ifconfig.me/ip 2>/dev/null \
         || echo "无法获取"
 }
 
 validate_ssh_pubkey() {
     local key="$1"
-    [[ -z "$key" ]] && return 1
-    echo "$key" | grep -qE '^(ssh-(ed25519|rsa)|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/=]+'
+    [[ -n "$key" && "$key" != *$'\n'* && "$key" != *$'\r'* ]] || return 1
+    [[ "$key" =~ ^(ssh-(ed25519|rsa)|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com)[[:blank:]] ]] || return 1
+    command -v ssh-keygen &>/dev/null || return 1
+    # 交给 OpenSSH 解码实际密钥, 不能只验证 base64 字符的外观。
+    ssh-keygen -lf /dev/stdin <<< "$key" >/dev/null 2>&1
 }
 
 validate_port() {
     local port="$1"
-    [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1024 && port <= 65535 ))
+    local minimum="${2:-1024}"
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] && (( 10#$port >= minimum && 10#$port <= 65535 ))
+}
+
+ssh_effective_config() {
+    local user="${1:-${NEW_USER:-root}}" config="${2:-$SSHD_CONFIG}"
+    local connection="${SSH_CONNECTION:-}"
+    local addr _client_port local_addr local_port
+    read -r addr _client_port local_addr local_port <<< "$connection"
+    local_port="${3:-${local_port:-22}}"
+    sshd -T -f "$config" -C "user=$user,host=${addr:-localhost},addr=${addr:-127.0.0.1},laddr=${local_addr:-127.0.0.1},lport=$local_port"
+}
+
+get_configured_ssh_ports() {
+    ssh_effective_config | awk '$1 == "port" && !seen[$2]++ {print $2}'
 }
 
 get_current_ssh_port() {
-    local port
-    port=$(grep -E '^\s*Port\s+' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | head -1)
-    echo "${port:-22}"
+    local _client_ip _client_port server_ip server_port
+    if [[ -n "${SSH_CONNECTION:-}" ]]; then
+        read -r _client_ip _client_port server_ip server_port <<< "$SSH_CONNECTION"
+        if validate_port "$server_port" 1; then
+            printf '%s\n' "$server_port"
+            return
+        fi
+    fi
+    get_configured_ssh_ports | awk 'NR == 1 {print}'
+}
+
+get_user_home() {
+    getent passwd "$1" | awk -F: '$6 ~ /^\// {print $6}'
 }
 
 # ========================== 发行版检测与适配 ==========================
@@ -141,7 +139,8 @@ detect_os() {
 
     . /etc/os-release
     OS_ID="${ID,,}"
-    OS_VERSION="${VERSION_ID%%.*}"
+    OS_VERSION="${VERSION_ID:-}"
+    OS_VERSION="${OS_VERSION%%.*}"
 
     case "$OS_ID" in
         ubuntu|debian|linuxmint|pop|kali|deepin)
@@ -184,7 +183,7 @@ detect_os() {
             OS_FAMILY="arch"
             SUDO_GROUP="wheel"
             SSH_SERVICE="sshd"
-            FW_TYPE="iptables"
+            FW_TYPE="ufw"
             F2B_LOGPATH="%(sshd_log)s"
             F2B_BACKEND="systemd"
             ;;
@@ -232,7 +231,8 @@ detect_os() {
 
     # Debian 系的 SSH 服务名可能是 ssh 或 sshd, 实际检测一下
     if [[ "$OS_FAMILY" == "debian" ]]; then
-        if systemctl list-unit-files sshd.service &>/dev/null 2>&1; then
+        if [[ "$(systemctl show -p LoadState --value ssh.service 2>/dev/null)" != "loaded" ]] &&
+           [[ "$(systemctl show -p LoadState --value sshd.service 2>/dev/null)" == "loaded" ]]; then
             SSH_SERVICE="sshd"
         fi
     fi
@@ -241,7 +241,7 @@ detect_os() {
 # ========================== 包管理器抽象层 ==========================
 pkg_update() {
     case "$OS_FAMILY" in
-        debian)  apt update -y && apt full-upgrade -y ;;
+        debian)  apt-get update && apt-get upgrade -y ;;
         rhel)
             if command -v dnf &>/dev/null; then
                 dnf upgrade -y
@@ -257,12 +257,12 @@ pkg_update() {
 
 pkg_clean() {
     case "$OS_FAMILY" in
-        debian)  apt autoremove -y && apt autoclean -y ;;
+        debian)  apt-get autoclean -y ;;
         rhel)
             if command -v dnf &>/dev/null; then
-                dnf autoremove -y
+                dnf clean packages
             else
-                yum autoremove -y 2>/dev/null || true
+                yum clean packages
             fi
             ;;
         arch)    pacman -Sc --noconfirm 2>/dev/null || true ;;
@@ -274,7 +274,7 @@ pkg_clean() {
 pkg_install() {
     local packages=("$@")
     case "$OS_FAMILY" in
-        debian)  apt install -y "${packages[@]}" ;;
+        debian)  apt-get install -y "${packages[@]}" ;;
         rhel)
             if command -v dnf &>/dev/null; then
                 dnf install -y "${packages[@]}"
@@ -309,7 +309,7 @@ get_base_packages() {
         rhel)
             # EPEL is needed for fail2ban on RHEL-based
             if [[ "$OS_ID" != "fedora" ]]; then
-                echo "sudo $common_all net-tools firewalld fail2ban epel-release"
+                echo "sudo $common_all net-tools firewalld fail2ban"
             else
                 echo "sudo $common_all net-tools firewalld fail2ban"
             fi
@@ -321,7 +321,7 @@ get_base_packages() {
             echo "sudo $common_all net-tools firewalld fail2ban"
             ;;
         alpine)
-            echo "sudo $common_all net-tools fail2ban ip6tables"
+            echo "sudo $common_all net-tools fail2ban iptables ip6tables iproute2 util-linux tzdata"
             ;;
     esac
 }
@@ -331,8 +331,9 @@ check_reboot_required() {
         [[ -f /var/run/reboot-required ]]
     elif [[ "$OS_FAMILY" == "rhel" ]]; then
         if command -v needs-restarting &>/dev/null; then
-            needs-restarting -r &>/dev/null
-            [[ $? -eq 1 ]]
+            local result=0
+            needs-restarting -r &>/dev/null || result=$?
+            [[ "$result" -eq 1 ]]
         else
             false
         fi
@@ -342,23 +343,72 @@ check_reboot_required() {
 }
 
 # ========================== 防火墙抽象层 ==========================
-fw_allow_port() {
-    local port="$1"
-    local proto="${2:-tcp}"
-    local comment="${3:-}"
-
+fw_is_active() {
     case "$FW_TYPE" in
-        ufw)
-            ufw allow "$port/$proto" ${comment:+comment "$comment"} 2>/dev/null \
-                || ufw allow "$port/$proto"
-            ;;
+        ufw) LC_ALL=C ufw status 2>/dev/null | grep -q '^Status: active' ;;
+        firewalld) firewall-cmd --state &>/dev/null ;;
+        iptables) iptables -S INPUT 2>/dev/null | grep -q '^-P INPUT DROP$' ;;
+        *) return 1 ;;
+    esac
+}
+
+fw_prepare_zones() {
+    FW_ZONES=()
+    local zone zones default_zone
+    if firewall-cmd --state &>/dev/null; then
+        default_zone=$(firewall-cmd --get-default-zone) || return 1
+        zones=$(firewall-cmd --get-active-zones) || return 1
+        zones=$(awk '/^[^[:space:]]/ {print $1}' <<< "$zones")
+    else
+        default_zone=$(firewall-offline-cmd --get-default-zone) || return 1
+        # 停用的 firewalld 也可能已有接口/source 绑定, 不能只放行默认 zone。
+        zones=""
+        local all_zones interfaces sources
+        all_zones=$(firewall-offline-cmd --get-zones) || return 1
+        for zone in $all_zones; do
+            interfaces=$(firewall-offline-cmd --zone="$zone" --list-interfaces) || return 1
+            sources=$(firewall-offline-cmd --zone="$zone" --list-sources) || return 1
+            if [[ -n "$interfaces$sources" ]]; then
+                zones+="$zone"$'\n'
+            fi
+        done
+    fi
+    while IFS= read -r zone; do
+        [[ -n "$zone" ]] && FW_ZONES+=("$zone")
+    done < <(printf '%s\n%s\n' "$default_zone" "$zones" | awk 'NF && !seen[$1]++ {print $1}')
+}
+
+iptables_allow() {
+    local tool="$1"
+    shift
+    "$tool" -C INPUT "$@" 2>/dev/null || "$tool" -I INPUT 1 "$@"
+}
+
+fw_allow_port() {
+    local port="$1" proto="${2:-tcp}" zone
+    validate_port "$port" 1 && [[ "$proto" == tcp || "$proto" == udp ]] || return 1
+    case "$FW_TYPE" in
+        ufw) ufw allow "$port/$proto" ;;
         firewalld)
-            firewall-cmd --permanent --add-port="$port/$proto"
+            for zone in "${FW_ZONES[@]}"; do
+                if firewall-cmd --state &>/dev/null; then
+                    if ! firewall-cmd --zone="$zone" --query-port="$port/$proto" >/dev/null; then
+                        # 回滚时仅撤销本次新增的运行时规则, 保留管理员原有临时规则。
+                        if [[ -n "$ROLLBACK_DIR" ]]; then
+                            printf 'firewall-cmd --zone=%q --remove-port=%q\n' "$zone" "$port/$proto" >> "$ROLLBACK_DIR/runtime-undo.sh" || return 1
+                        fi
+                        firewall-cmd --zone="$zone" --add-port="$port/$proto" || return 1
+                    fi
+                    firewall-cmd --permanent --zone="$zone" --add-port="$port/$proto" || return 1
+                else
+                    firewall-offline-cmd --zone="$zone" --add-port="$port/$proto" || return 1
+                fi
+            done
             ;;
         iptables)
-            iptables -A INPUT -p "$proto" --dport "$port" -j ACCEPT
+            iptables_allow iptables -p "$proto" --dport "$port" -j ACCEPT || return 1
             if command -v ip6tables &>/dev/null; then
-                ip6tables -A INPUT -p "$proto" --dport "$port" -j ACCEPT
+                iptables_allow ip6tables -p "$proto" --dport "$port" -j ACCEPT || return 1
             fi
             ;;
     esac
@@ -367,25 +417,31 @@ fw_allow_port() {
 fw_set_defaults() {
     case "$FW_TYPE" in
         ufw)
-            ufw default deny incoming
-            ufw default allow outgoing
+            ufw default deny incoming && ufw default allow outgoing
             ;;
         firewalld)
-            firewall-cmd --set-default-zone=drop 2>/dev/null || true
-            firewall-cmd --permanent --zone=drop --add-service=dhcpv6-client 2>/dev/null || true
+            # 保留原有 zone/接口绑定/目标; 默认 public 已拒绝未放行入站。
+            info "保留现有 firewalld zone 策略: ${FW_ZONES[*]}"
             ;;
         iptables)
-            iptables -P INPUT DROP
-            iptables -P FORWARD DROP
-            iptables -P OUTPUT ACCEPT
-            iptables -A INPUT -i lo -j ACCEPT
-            iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+            local tool
+            for tool in iptables ip6tables; do
+                command -v "$tool" &>/dev/null || continue
+                iptables_allow "$tool" -i lo -j ACCEPT || return 1
+                iptables_allow "$tool" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || return 1
+                if [[ "$tool" == ip6tables ]]; then
+                    # IPv6 邻居发现、路由通告和 PMTU 依赖 ICMPv6。
+                    iptables_allow "$tool" -p ipv6-icmp -j ACCEPT || return 1
+                    iptables_allow "$tool" -p udp --sport 547 --dport 546 -j ACCEPT || return 1
+                else
+                    iptables_allow "$tool" -p icmp -j ACCEPT || return 1
+                    iptables_allow "$tool" -p udp --sport 67 --dport 68 -j ACCEPT || return 1
+                fi
+            done
+            # 所有保活规则和 SSH 放行成功之后才改变 INPUT; 不改容器/VPN 转发策略。
+            iptables -P INPUT DROP || return 1
             if command -v ip6tables &>/dev/null; then
-                ip6tables -P INPUT DROP
-                ip6tables -P FORWARD DROP
-                ip6tables -P OUTPUT ACCEPT
-                ip6tables -A INPUT -i lo -j ACCEPT
-                ip6tables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+                ip6tables -P INPUT DROP || return 1
             fi
             ;;
     esac
@@ -393,102 +449,190 @@ fw_set_defaults() {
 
 fw_enable() {
     case "$FW_TYPE" in
-        ufw)
-            echo "y" | ufw enable
-            ;;
-        firewalld)
-            systemctl enable --now firewalld
-            firewall-cmd --reload
-            ;;
-        iptables)
-            # 持久化 iptables 规则
-            if command -v iptables-save &>/dev/null; then
-                mkdir -p /etc/iptables
-                iptables-save > /etc/iptables/rules.v4
-                if command -v ip6tables-save &>/dev/null; then
-                    ip6tables-save > /etc/iptables/rules.v6
-                fi
-                success "iptables 规则已保存"
+        ufw) ufw --force enable ;;
+        firewalld) systemctl start firewalld ;;
+        iptables) return 0 ;;
+    esac
+}
 
-                if [[ "$OS_FAMILY" == "arch" ]]; then
-                    systemctl enable iptables 2>/dev/null || true
-                fi
-            fi
+fw_persist() {
+    case "$FW_TYPE:$OS_FAMILY" in
+        firewalld:*) systemctl enable firewalld ;;
+        iptables:arch)
+            mkdir -p /etc/iptables
+            iptables-save > /etc/iptables/iptables.rules || return 1
+            ip6tables-save > /etc/iptables/ip6tables.rules || return 1
+            systemctl enable iptables ip6tables
+            ;;
+        iptables:alpine)
+            mkdir -p /etc/iptables
+            iptables-save > /etc/iptables/rules-save || return 1
+            ip6tables-save > /etc/iptables/rules6-save || return 1
+            rc-update add iptables default && rc-update add ip6tables default
+            ;;
+        iptables:*)
+            warn "当前发行版未配置 iptables 开机恢复, 规则仅在本次启动有效"
             ;;
     esac
 }
 
 fw_status() {
     case "$FW_TYPE" in
-        ufw)       ufw status verbose ;;
-        firewalld) firewall-cmd --list-all ;;
-        iptables)  iptables -L -n --line-numbers ;;
+        ufw) ufw status verbose ;;
+        firewalld) firewall-cmd --list-all-zones ;;
+        iptables) iptables -S INPUT; ip6tables -S INPUT ;;
     esac
 }
 
-fw_is_active() {
+prepare_firewall_rollback() {
+    local dir="$1" active=false
+    fw_is_active && active=true
+    printf '#!/bin/bash\nset -e\n' > "$dir/runtime-undo.sh" || return 1
     case "$FW_TYPE" in
-        ufw)       ufw status 2>/dev/null | grep -q "Status: active" ;;
-        firewalld) systemctl is-active firewalld &>/dev/null ;;
-        iptables)  iptables -L -n 2>/dev/null | grep -qv "^$" ;;
+        ufw|firewalld) cp -a "/etc/$FW_TYPE" "$dir/original" || return 1 ;;
+        iptables)
+            iptables-save > "$dir/rules.v4" || return 1
+            if command -v ip6tables &>/dev/null; then
+                ip6tables-save > "$dir/rules.v6" || return 1
+            fi
+            ;;
     esac
+    {
+        echo '#!/bin/bash'
+        echo 'set -e'
+        printf 'dir=%q\nbackend=%q\nactive=%q\n' "$dir" "$FW_TYPE" "$active"
+        cat <<'EOF'
+if ! mv "$dir/pending" "$dir/rolling-back" 2>/dev/null; then exit 0; fi
+case "$backend" in
+    ufw|firewalld)
+        mv "/etc/$backend" "$dir/failed-config"
+        cp -a "$dir/original" "/etc/$backend"
+        if [[ "$backend" == ufw ]]; then
+            if "$active"; then ufw reload; else ufw --force disable; fi
+        elif "$active"; then
+            bash "$dir/runtime-undo.sh"
+        else
+            systemctl stop firewalld
+        fi
+        ;;
+    iptables)
+        iptables-restore < "$dir/rules.v4"
+        if [[ -f "$dir/rules.v6" ]]; then ip6tables-restore < "$dir/rules.v6"; fi
+        ;;
+esac
+EOF
+    } > "$dir/rollback.sh"
+}
+
+# ========================== 关键修改的限时回滚 ==========================
+# pending 的原子重命名让确认与超时回滚只会有一个成功。
+rollback_on_exit() {
+    if [[ -n "$ROLLBACK_DIR" ]]; then
+        bash "$ROLLBACK_DIR/rollback.sh" || { error "自动回滚失败, 请检查 $ROLLBACK_DIR/rollback.log"; return 1; }
+    fi
+}
+
+start_rollback_guard() {
+    ROLLBACK_DIR="$1"
+    touch "$ROLLBACK_DIR/pending" || return 1
+    trap rollback_on_exit EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM HUP
+    nohup bash -c 'sleep "$1"; exec bash "$2/rollback.sh"' _ \
+        "$ROLLBACK_SECONDS" "$ROLLBACK_DIR" >"$ROLLBACK_DIR/rollback.log" 2>&1 </dev/null &
+    info "${ROLLBACK_SECONDS} 秒内未确认会自动回滚; 备份: $ROLLBACK_DIR"
+}
+
+finish_rollback_guard() {
+    local result=0
+    mv "$ROLLBACK_DIR/pending" "$ROLLBACK_DIR/confirmed" 2>/dev/null || result=1
+    ROLLBACK_DIR=""
+    trap - EXIT INT TERM HUP
+    return "$result"
+}
+
+cancel_rollback_guard() {
+    rollback_on_exit || return 1
+    ROLLBACK_DIR=""
+    trap - EXIT INT TERM HUP
 }
 
 # ========================== SSH 服务操作 ==========================
 ssh_restart() {
-    if systemctl restart "$SSH_SERVICE" 2>/dev/null; then
-        return 0
-    elif systemctl restart sshd 2>/dev/null; then
-        return 0
-    elif systemctl restart ssh 2>/dev/null; then
-        return 0
-    elif service sshd restart 2>/dev/null; then
-        return 0
-    elif rc-service sshd restart 2>/dev/null; then
-        return 0
+    # 优先 reload, 保留现有会话; socket 激活的端口修改在阶段 4 单独拦截。
+    if command -v systemctl &>/dev/null && [[ -d /run/systemd/system ]]; then
+        systemctl reload "$SSH_SERVICE" || systemctl restart "$SSH_SERVICE"
+    elif command -v rc-service &>/dev/null; then
+        rc-service sshd reload || rc-service sshd restart
+    elif command -v service &>/dev/null; then
+        service "$SSH_SERVICE" reload || service "$SSH_SERVICE" restart
     else
-        error "无法重启 SSH 服务"
+        error "无法重新加载 SSH 服务"
         return 1
     fi
 }
 
 ssh_syntax_check() {
-    sshd -t 2>/dev/null
+    sshd -t -f "${1:-$SSHD_CONFIG}"
+}
+
+render_ssh_config() {
+    local original="$1" settings="$2" output="$3"
+    {
+        echo '# BEGIN VPS-FIRST MANAGED'
+        cat "$settings"
+        echo '# END VPS-FIRST MANAGED'
+        # 只替换本脚本管理块, 不碰用户的 Match/Include 规则。
+        awk '
+            $0 == "# BEGIN VPS-FIRST MANAGED" {managed=1; next}
+            $0 == "# END VPS-FIRST MANAGED" {managed=0; next}
+            !managed {print}
+        ' "$original"
+    } > "$output"
 }
 
 # ========================== 用户创建抽象层 ==========================
-create_system_user() {
-    local username="$1"
-
-    case "$OS_FAMILY" in
-        debian)
-            adduser --gecos "" "$username"
-            ;;
-        rhel|arch|suse)
-            useradd -m -s /bin/bash "$username" 2>/dev/null || useradd -m "$username"
-            info "请为用户 '$username' 设置密码:"
-            passwd "$username"
-            ;;
-        alpine)
-            adduser -s /bin/ash "$username"
-            ;;
-    esac
-
-    usermod -aG "$SUDO_GROUP" "$username"
-
-    # RHEL/Arch: 确保 wheel 组在 sudoers 中启用
-    if [[ "$SUDO_GROUP" == "wheel" ]]; then
-        local sudoers="/etc/sudoers"
-        if [ -f "$sudoers" ]; then
-            # 取消注释 %wheel 行
-            if grep -q "^#.*%wheel.*ALL=(ALL).*ALL" "$sudoers" 2>/dev/null; then
-                sed -i 's/^#\s*\(%wheel\s\+ALL=(ALL)\s\+ALL\)/\1/' "$sudoers" 2>/dev/null || true
-            fi
-            if grep -q "^#.*%wheel.*ALL=(ALL:ALL).*ALL" "$sudoers" 2>/dev/null; then
-                sed -i 's/^#\s*\(%wheel\s\+ALL=(ALL:ALL)\s\+ALL\)/\1/' "$sudoers" 2>/dev/null || true
-            fi
+grant_sudo() {
+    local username="$1" sudo_file="/etc/sudoers.d/90-vps-first-$1"
+    command -v sudo &>/dev/null || { pkg_install sudo || return 1; }
+    command -v visudo &>/dev/null || return 1
+    if ! grep -Eq '^[[:space:]]*([#@]includedir)[[:space:]]+/etc/sudoers.d([[:space:]]|$)' /etc/sudoers; then
+        error "sudoers 未启用 /etc/sudoers.d, 请手动配置后再禁用 root"
+        return 1
+    fi
+    if [[ -e "$sudo_file" ]]; then
+        visudo -cf /etc/sudoers || return 1
+    else
+        mkdir -p /etc/sudoers.d
+        local tmp
+        tmp=$(mktemp /etc/sudoers.d/.vps-first.XXXXXX) || return 1
+        printf '%s ALL=(ALL:ALL) ALL\n' "$username" > "$tmp"
+        chmod 440 "$tmp"
+        if ! visudo -cf "$tmp"; then
+            rm -f "$tmp"
+            return 1
+        fi
+        mv "$tmp" "$sudo_file" || return 1
+        if ! visudo -cf /etc/sudoers; then
+            mv "$sudo_file" "${sudo_file}.invalid"
+            return 1
         fi
     fi
+    success "sudo 规则已检查; 仍需使用该用户实际执行 sudo -v 验证"
+}
+
+create_system_user() {
+    local username="$1"
+    case "$OS_FAMILY" in
+        debian) adduser --gecos "" "$username" || return 1 ;;
+        rhel|arch|suse)
+            useradd -m -s /bin/bash "$username" || return 1
+            info "请为用户 '$username' 设置密码:"
+            passwd "$username" || return 1
+            ;;
+        alpine) adduser -s /bin/ash "$username" || return 1 ;;
+    esac
+    grant_sudo "$username"
 }
 
 # ========================== SELinux 处理 ==========================
@@ -510,9 +654,14 @@ handle_selinux_ssh() {
     if [[ -n "${NEW_SSH_PORT:-}" ]] && [[ "$NEW_SSH_PORT" != "22" ]]; then
         if command -v semanage &>/dev/null; then
             info "正在为 SELinux 注册 SSH 端口 $NEW_SSH_PORT..."
-            semanage port -a -t ssh_port_t -p tcp "$NEW_SSH_PORT" 2>/dev/null \
-                || semanage port -m -t ssh_port_t -p tcp "$NEW_SSH_PORT" 2>/dev/null \
-                || warn "SELinux 端口注册失败, 可能需要手动处理"
+            if ! semanage port -l | awk -v port="$NEW_SSH_PORT" '
+                $1=="ssh_port_t" && $2=="tcp" {for(i=3;i<=NF;i++) {gsub(/,/, "", $i); if($i==port) found=1}}
+                END {exit !found}'; then
+                if ! semanage port -a -t ssh_port_t -p tcp "$NEW_SSH_PORT"; then
+                    warn "SELinux 端口注册失败, 跳过 SSH 修改 (不覆盖其他服务的端口类型)"
+                    return 1
+                fi
+            fi
         else
             warn "semanage 未安装, 无法自动配置 SELinux SSH 端口"
             warn "请手动安装: $(
@@ -522,6 +671,7 @@ handle_selinux_ssh() {
                 esac
             )"
             warn "然后执行: semanage port -a -t ssh_port_t -p tcp $NEW_SSH_PORT"
+            return 1
         fi
     fi
 
@@ -535,24 +685,31 @@ handle_selinux_ssh() {
 setup_auto_updates() {
     case "$OS_FAMILY" in
         debian)
-            pkg_install unattended-upgrades
+            pkg_install unattended-upgrades || return 1
+            if [[ -f /etc/apt/apt.conf.d/20auto-upgrades ]]; then
+                cp -p /etc/apt/apt.conf.d/20auto-upgrades "/etc/apt/apt.conf.d/20auto-upgrades.bak.$(date +%s)" || return 1
+            fi
             echo 'APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";' > /etc/apt/apt.conf.d/20auto-upgrades
             success "自动安全更新已启用 (unattended-upgrades)"
             ;;
         rhel)
             if command -v dnf &>/dev/null; then
-                pkg_install dnf-automatic
+                pkg_install dnf-automatic || return 1
+                [[ -f /etc/dnf/automatic.conf ]] || return 1
+                cp -p /etc/dnf/automatic.conf "/etc/dnf/automatic.conf.bak.$(date +%s)" || return 1
                 # 仅安装安全更新
                 sed -i 's/^upgrade_type\s*=.*/upgrade_type = security/' /etc/dnf/automatic.conf 2>/dev/null || true
                 sed -i 's/^apply_updates\s*=.*/apply_updates = yes/' /etc/dnf/automatic.conf 2>/dev/null || true
-                systemctl enable --now dnf-automatic.timer
+                systemctl enable --now dnf-automatic.timer || return 1
                 success "自动安全更新已启用 (dnf-automatic)"
             else
-                pkg_install yum-cron
+                pkg_install yum-cron || return 1
+                [[ -f /etc/yum/yum-cron.conf ]] || return 1
+                cp -p /etc/yum/yum-cron.conf "/etc/yum/yum-cron.conf.bak.$(date +%s)" || return 1
                 sed -i 's/^update_cmd\s*=.*/update_cmd = security/' /etc/yum/yum-cron.conf 2>/dev/null || true
                 sed -i 's/^apply_updates\s*=.*/apply_updates = yes/' /etc/yum/yum-cron.conf 2>/dev/null || true
-                systemctl enable --now yum-cron
+                systemctl enable --now yum-cron || return 1
                 success "自动安全更新已启用 (yum-cron)"
             fi
             ;;
@@ -575,6 +732,11 @@ phase0_precheck() {
     step "阶段 0/7: 前置检查"
 
     detect_os
+    command -v sshd &>/dev/null && [[ -f "$SSHD_CONFIG" ]] || {
+        error "未找到 OpenSSH 服务端或配置文件, 无法安全初始化"
+        return 1
+    }
+    ssh_syntax_check || return 1
 
     info "系统信息:"
     info "  发行版:   ${PRETTY_NAME:-$OS_ID}"
@@ -610,160 +772,29 @@ phase0_precheck() {
     fi
 }
 
-# ========================== EOL 源修复 ==========================
-# 各发行版 EOL 后官方镜像下线, 需要切换到归档源才能安装软件包
-# CentOS 7/8 → vault.centos.org
-# Debian ≤10  → archive.debian.org
-# Ubuntu EOL  → old-releases.ubuntu.com
-# Fedora EOL  → archives.fedoraproject.org
-
-_check_url_reachable() {
-    local url="$1"
-    if command -v curl &>/dev/null; then
-        curl -sfL --head --max-time 10 "$url" >/dev/null 2>&1
-    elif command -v wget &>/dev/null; then
-        wget -q --spider --timeout=10 "$url" 2>/dev/null
-    else
-        return 0
-    fi
-}
-
-_fix_centos_eol() {
-    local vault_base="http://vault.centos.org"
-    local needs_fix=false
-
-    if [[ "$OS_VERSION" == "7" || "$OS_VERSION" == "8" ]]; then
-        for repo in /etc/yum.repos.d/CentOS-*.repo; do
-            [[ -f "$repo" ]] || continue
-            if grep -qE '^\s*mirrorlist=' "$repo" 2>/dev/null; then
-                needs_fix=true
-                break
-            fi
-        done
-    else
-        return 0
-    fi
-
-    $needs_fix || return 0
-
-    warn "CentOS $OS_VERSION 已 EOL, 官方镜像已下线"
-    info "将 yum 源切换到 vault.centos.org..."
-
-    for repo in /etc/yum.repos.d/CentOS-*.repo; do
-        [[ -f "$repo" ]] || continue
-        cp "$repo" "${repo}.bak.$(date +%s)" 2>/dev/null || true
-        sed -i 's|^\s*mirrorlist=|#mirrorlist=|g' "$repo"
-        if [[ "$OS_VERSION" == "7" ]]; then
-            sed -i 's|^#\s*baseurl=http://mirror.centos.org/centos|baseurl='"$vault_base"'/centos|g' "$repo"
-            sed -i 's|^baseurl=http://mirror.centos.org/centos|baseurl='"$vault_base"'/centos|g' "$repo"
-        else
-            sed -i 's|^#\s*baseurl=http://mirror.centos.org|baseurl='"$vault_base"'/centos|g' "$repo"
-            sed -i 's|^baseurl=http://mirror.centos.org|baseurl='"$vault_base"'/centos|g' "$repo"
-        fi
-    done
-
-    yum clean all &>/dev/null || true
-    success "yum 源已切换到 vault.centos.org"
-}
-
-_fix_debian_eol() {
-    [[ "$OS_VERSION" -ge 11 ]] && return 0
-
-    grep -q "archive.debian.org" /etc/apt/sources.list 2>/dev/null && return 0
-
-    local codename
-    codename=$(. /etc/os-release && echo "${VERSION_CODENAME:-}")
-    [[ -z "$codename" ]] && return 0
-
-    if _check_url_reachable "http://deb.debian.org/debian/dists/${codename}/Release"; then
-        return 0
-    fi
-
-    warn "Debian $OS_VERSION ($codename) 已 EOL, 常规镜像已下线"
-    info "将 apt 源切换到 archive.debian.org..."
-
-    cp /etc/apt/sources.list "/etc/apt/sources.list.bak.$(date +%s)" 2>/dev/null || true
-    sed -i -E 's|https?://[a-zA-Z0-9.\-]+/debian/?|http://archive.debian.org/debian/|g' /etc/apt/sources.list
-    sed -i -E 's|https?://security\.debian\.org[^ ]*|http://archive.debian.org/debian-security/|g' /etc/apt/sources.list
-
-    echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99no-check-valid-until
-    apt-get clean 2>/dev/null || true
-    success "apt 源已切换到 archive.debian.org"
-}
-
-_fix_ubuntu_eol() {
-    grep -q "old-releases.ubuntu.com" /etc/apt/sources.list 2>/dev/null && return 0
-
-    local codename
-    codename=$(. /etc/os-release && echo "${VERSION_CODENAME:-}")
-    [[ -z "$codename" ]] && return 0
-
-    if _check_url_reachable "http://archive.ubuntu.com/ubuntu/dists/${codename}/Release"; then
-        return 0
-    fi
-
-    if ! _check_url_reachable "http://old-releases.ubuntu.com/ubuntu/dists/${codename}/Release"; then
-        return 0
-    fi
-
-    warn "Ubuntu ($codename) 已 EOL, 常规镜像已下线"
-    info "将 apt 源切换到 old-releases.ubuntu.com..."
-
-    cp /etc/apt/sources.list "/etc/apt/sources.list.bak.$(date +%s)" 2>/dev/null || true
-    sed -i -E 's|https?://[a-zA-Z0-9.\-]+/ubuntu/?|http://old-releases.ubuntu.com/ubuntu/|g' /etc/apt/sources.list
-    sed -i -E 's|https?://security\.ubuntu\.com/ubuntu/?|http://old-releases.ubuntu.com/ubuntu/|g' /etc/apt/sources.list
-
-    apt-get clean 2>/dev/null || true
-    success "apt 源已切换到 old-releases.ubuntu.com"
-}
-
-_fix_fedora_eol() {
-    local release
-    release=$(rpm -E %fedora 2>/dev/null || echo "$OS_VERSION")
-
-    if _check_url_reachable "https://mirrors.fedoraproject.org/metalink?repo=fedora-${release}&arch=$(uname -m)"; then
-        return 0
-    fi
-
-    local has_metalink=false
-    for repo in /etc/yum.repos.d/fedora*.repo; do
-        [[ -f "$repo" ]] || continue
-        if grep -qE '^\s*metalink=' "$repo" 2>/dev/null; then
-            has_metalink=true
-            break
-        fi
-    done
-    $has_metalink || return 0
-
-    warn "Fedora $release 已 EOL, 标准镜像已下线"
-    info "将 dnf 源切换到 archives.fedoraproject.org..."
-
-    for repo in /etc/yum.repos.d/fedora*.repo; do
-        [[ -f "$repo" ]] || continue
-        cp "$repo" "${repo}.bak.$(date +%s)" 2>/dev/null || true
-        sed -i 's|^\s*metalink=|#metalink=|g' "$repo"
-        sed -i 's|^#baseurl=http://download.example/pub/fedora/linux|baseurl=https://archives.fedoraproject.org/pub/archive/fedora/linux|g' "$repo"
-    done
-
-    dnf clean all &>/dev/null || true
-    success "dnf 源已切换到 archives.fedoraproject.org"
-}
-
+# ========================== EOL 源提示 ==========================
 fix_eol_repos() {
+    # 旧版本号、网络超时、镜像维护都不足以证明应当切换仓库。
+    # 不关闭全局签名/有效期检查, 也不改第三方仓库和 deb822 sources。
+    warn "归档源不能恢复安全更新; 建议先迁移到受支持的发行版"
     case "$OS_ID" in
-        centos)  _fix_centos_eol ;;
-        debian)  _fix_debian_eol ;;
-        ubuntu)  _fix_ubuntu_eol ;;
-        fedora)  _fix_fedora_eol ;;
+        centos) info "CentOS 归档索引: https://vault.centos.org/" ;;
+        debian) info "Debian 归档索引: https://archive.debian.org/debian/" ;;
+        ubuntu) info "Ubuntu 归档索引: https://old-releases.ubuntu.com/ubuntu/" ;;
+        fedora) info "Fedora 归档索引: https://archives.fedoraproject.org/pub/archive/fedora/linux/" ;;
+        *) info "请按发行版官方文档检查软件源" ;;
     esac
+    info "请确认具体版本和源文件格式后手动修复, 脚本不会自动改写软件源"
 }
 
 # ========================== 阶段 1: 系统更新与工具安装 ==========================
 phase1_system_update() {
     step "阶段 1/7: 系统更新与基础工具安装"
 
-    # --- EOL 源修复 (必须在任何包操作之前) ---
-    fix_eol_repos
+    # --- 可选查看旧版系统的软件源说明 ---
+    if confirm "是否查看 EOL 旧版系统的软件源说明?" "n"; then
+        fix_eol_repos
+    fi
 
     # --- EPEL 源 (RHEL 家族需要) ---
     if [[ "$OS_FAMILY" == "rhel" ]] && [[ "$OS_ID" != "fedora" ]]; then
@@ -849,12 +880,16 @@ phase2_create_user() {
         return 1
     fi
 
+    if id "$username" &>/dev/null && [[ "$(id -u "$username")" == 0 ]]; then
+        warn "必须选择 UID 不为 0 的用户; 保持当前 root 配置"
+        return 0
+    fi
     if id "$username" &>/dev/null; then
         warn "用户 '$username' 已存在"
         if confirm "是否直接使用该用户继续?"; then
             NEW_USER="$username"
-            usermod -aG "$SUDO_GROUP" "$username" 2>/dev/null || true
-            success "将使用已有用户: $username (已确保在 $SUDO_GROUP 组)"
+            grant_sudo "$username" || warn "sudo 权限尚未就绪, 不会自动禁用 root"
+            success "将使用已有用户: $username"
             return 0
         else
             error "请重新运行脚本并选择其他用户名"
@@ -863,8 +898,11 @@ phase2_create_user() {
     fi
 
     info "正在创建用户 '$username'..."
-    create_system_user "$username"
-    success "用户 '$username' 已创建并加入 $SUDO_GROUP 组"
+    if ! create_system_user "$username"; then
+        warn "用户创建或 sudo 配置未完成, 保持 root 登录设置"
+        return 0
+    fi
+    success "用户 '$username' 已创建"
 
     NEW_USER="$username"
 }
@@ -885,9 +923,11 @@ phase3_ssh_key() {
     echo -e "  ${CYAN}cat \$env:USERPROFILE\\.ssh\\id_ed25519.pub${NC}  (PowerShell)"
     echo ""
 
+    SSH_KEY_CONFIGURED=false
+    SUDO_VERIFIED=false
     if ! confirm "你是否已经准备好 SSH 公钥?"; then
         warn "跳过 SSH 密钥配置"
-        warn "后续的 SSH 安全加固将不会禁用密码登录"
+        warn "后续保持现有密码登录设置"
         SSH_KEY_CONFIGURED=false
         return 0
     fi
@@ -943,22 +983,31 @@ phase3_ssh_key() {
     # 安装公钥
     local target_user="${NEW_USER:-root}"
     local user_home
-    user_home=$(eval echo "~${target_user}")
+    user_home=$(get_user_home "$target_user")
+    [[ -n "$user_home" && -d "$user_home" ]] || { error "用户主目录不存在"; return 1; }
     local ssh_dir="$user_home/.ssh"
     local auth_keys="$ssh_dir/authorized_keys"
 
+    if [[ -L "$ssh_dir" || -L "$auth_keys" ]]; then
+        warn "SSH 目录或 authorized_keys 是符号链接, 请手动安装公钥"
+        return 0
+    fi
     mkdir -p "$ssh_dir"
     chmod 700 "$ssh_dir"
 
-    if [ -f "$auth_keys" ] && grep -qF "$pubkey" "$auth_keys" 2>/dev/null; then
+    if [ -f "$auth_keys" ] && grep -qxF "$pubkey" "$auth_keys" 2>/dev/null; then
         warn "该公钥已存在于 authorized_keys 中, 无需重复添加"
     else
-        echo "$pubkey" >> "$auth_keys"
+        if [[ -f "$auth_keys" ]]; then
+            cp -p "$auth_keys" "${auth_keys}.bak.$(date +%Y%m%d%H%M%S)"
+        fi
+        # 兼容旧文件最后一行没有换行符。
+        printf '\n%s\n' "$pubkey" >> "$auth_keys"
         success "公钥已写入 $auth_keys"
     fi
 
     chmod 600 "$auth_keys"
-    chown -R "${target_user}:${target_user}" "$ssh_dir"
+    chown "${target_user}:$(id -gn "$target_user")" "$ssh_dir" "$auth_keys"
 
     # SELinux: 修复上下文
     if command -v restorecon &>/dev/null; then
@@ -977,15 +1026,21 @@ phase3_ssh_key() {
     server_ip=$(get_server_ip)
     local current_port
     current_port=$(get_current_ssh_port)
-    echo -e "  ${CYAN}ssh -p $current_port ${NEW_USER:-root}@${server_ip}${NC}"
+    echo -e "  ${CYAN}ssh -o ControlMaster=no -o ControlPath=none -o PreferredAuthentications=publickey -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -p $current_port ${NEW_USER:-root}@${server_ip}${NC}"
     echo ""
     echo -e "${YELLOW}请确认: 不需要输入 服务器密码 就能登录成功${NC}"
     echo -e "${YELLOW}(如果给私钥设了 passphrase, 会提示输入私钥密码, 这是正常的)${NC}"
     echo ""
 
-    if confirm "密钥登录测试是否成功? (一定要先测试再回答!)"; then
+    if confirm "密钥登录测试是否成功? (一定要先测试再回答!)" "n"; then
         SSH_KEY_CONFIGURED=true
-        success "SSH 密钥验证通过, 后续将安全地禁用密码登录"
+        success "SSH 密钥验证通过"
+        if [[ -n "$NEW_USER" ]]; then
+            info "请在新用户终端执行 sudo -k; sudo -v, 确认能够提权"
+            if confirm "新用户 sudo -v 是否成功?" "n"; then
+                SUDO_VERIFIED=true
+            fi
+        fi
     else
         SSH_KEY_CONFIGURED=false
         warn "密钥登录未成功"
@@ -997,251 +1052,239 @@ phase3_ssh_key() {
             echo "  3. SELinux 阻止访问 (检查: audit2why < /var/log/audit/audit.log)"
         fi
         echo ""
-        warn "密码登录将保持开启状态以防止被锁定"
+        warn "现有密码登录设置不会被改动"
     fi
 }
 
 # ========================== 阶段 4: SSH 安全加固 ==========================
 phase4_ssh_harden() {
     step "阶段 4/7: SSH 安全加固"
-
-    local sshd_config="/etc/ssh/sshd_config"
-    local sshd_backup="/etc/ssh/sshd_config.bak.$(date +%Y%m%d%H%M%S)"
-
-    cp "$sshd_config" "$sshd_backup"
-    success "SSH 配置已备份到: $sshd_backup"
-
-    # --- 端口 ---
-    echo ""
-    local current_port
+    local current_port new_port ports
     current_port=$(get_current_ssh_port)
-    info "当前 SSH 端口: $current_port"
-    echo ""
-    warn "注意: 部分云厂商 (阿里云/腾讯云/AWS 等) 的防火墙/安全组在控制台配置,"
-    warn "系统内改端口后还需要去厂商控制台放行对应端口, 否则会连不上。"
-    warn "轻量服务器的 SSH 可能由平台代理, 改端口不生效。"
-    warn "如果不确定, 建议保持默认端口不变。"
-    echo ""
+    NEW_SSH_PORT="$current_port"
+    ports=$(get_configured_ssh_ports) || return 1
+    new_port="$current_port"
+    info "当前连接端口: $current_port; sshd 配置端口: ${ports//$'\n'/, }"
 
-    local new_port
-    if confirm "是否修改 SSH 端口?" "n"; then
-        read -rp "$(echo -e "${CYAN}请输入新的 SSH 端口 (1024-65535) [默认: $DEFAULT_SSH_PORT]: ${NC}")" new_port
-        new_port="${new_port:-$DEFAULT_SSH_PORT}"
-        if ! validate_port "$new_port"; then
-            warn "端口不合法 (需要 1024-65535), 保持当前端口: $current_port"
-            new_port="$current_port"
-        fi
-    else
-        new_port="$current_port"
-        info "保持当前端口: $new_port"
-    fi
-    NEW_SSH_PORT="$new_port"
-
-    # --- 修改配置 ---
-    local tmp_config
-    tmp_config=$(mktemp)
-    cp "$sshd_config" "$tmp_config"
-
-    # sed 兼容: 部分系统的 sed 不支持 \s, 改用 [ \t]
-    local apply_setting
-    apply_setting() {
-        local key="$1"
-        local value="$2"
-        local file="$3"
-        if grep -qE "^[ \t]*#?[ \t]*${key}[ \t]+" "$file"; then
-            sed -i "s/^[ \t]*#*[ \t]*${key}[ \t].*/${key} ${value}/" "$file"
+    if confirm "是否增加新的 SSH 端口? (保留原端口便于恢复)" "n"; then
+        if systemctl is-active --quiet ssh.socket 2>/dev/null ||
+           systemctl is-active --quiet sshd.socket 2>/dev/null; then
+            warn "检测到 SSH socket 激活; 本脚本保留端口, 请另行配置 socket 监听地址"
         else
-            echo "${key} ${value}" >> "$file"
+            read -rp "新端口 (1024-65535) [默认: $DEFAULT_SSH_PORT]: " new_port
+            new_port="${new_port:-$DEFAULT_SSH_PORT}"
+            if validate_port "$new_port"; then
+                new_port=$((10#$new_port))
+            else
+                warn "端口不合法, 保持 $current_port"
+                new_port="$current_port"
+            fi
         fi
-    }
-
-    apply_setting "Port" "$NEW_SSH_PORT" "$tmp_config"
-    apply_setting "PubkeyAuthentication" "yes" "$tmp_config"
-    apply_setting "MaxAuthTries" "3" "$tmp_config"
-    apply_setting "ClientAliveInterval" "3600" "$tmp_config"
-    apply_setting "ClientAliveCountMax" "2" "$tmp_config"
-    apply_setting "PermitEmptyPasswords" "no" "$tmp_config"
-
-    # Root 登录: 有独立用户时禁止, 否则保留
-    local root_login_setting="yes"
-    if [[ -n "${NEW_USER:-}" ]]; then
-        root_login_setting="no"
     fi
-    apply_setting "PermitRootLogin" "$root_login_setting" "$tmp_config"
 
+    local tmp_dir settings candidate
+    tmp_dir=$(mktemp -d "${SSHD_CONFIG}.vps-first.XXXXXX")
+    settings="$tmp_dir/settings"
+    candidate="$tmp_dir/candidate"
+    # Port 是可多次设置的选项, 保留已有管理块里的端口。
+    { printf '%s\n' "$ports"; echo "$current_port"; echo "$new_port"; } |
+        awk 'NF && !seen[$1]++ {print "Port " $1}' > "$settings"
+    cat >> "$settings" <<'EOF'
+PubkeyAuthentication yes
+MaxAuthTries 3
+PermitEmptyPasswords no
+EOF
     if [[ "$SSH_KEY_CONFIGURED" == true ]]; then
-        apply_setting "PasswordAuthentication" "no" "$tmp_config"
-        info "密码登录将被禁用 (密钥已验证通过)"
-    else
-        apply_setting "PasswordAuthentication" "yes" "$tmp_config"
-        warn "密码登录保持开启 (密钥未验证, 防止锁定)"
+        cat >> "$settings" <<'EOF'
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+EOF
+        # root 继续用密钥时不再允许其密码登录。
+        if [[ -z "$NEW_USER" ]]; then
+            local current_root
+            current_root=$(ssh_effective_config root | awk '$1=="permitrootlogin" {print $2}') || return 1
+            if [[ "$current_root" != no ]]; then
+                echo 'PermitRootLogin prohibit-password' >> "$settings"
+            fi
+        elif [[ "$SUDO_VERIFIED" == true ]]; then
+            echo 'PermitRootLogin no' >> "$settings"
+        fi
     fi
-
-    # 摘要
-    echo ""
-    info "SSH 配置变更摘要:"
-    echo "  端口:            $(get_current_ssh_port) -> $NEW_SSH_PORT"
-    if [[ -n "${NEW_USER:-}" ]]; then
-        echo "  Root 登录:       -> 禁止"
-    else
-        echo "  Root 登录:       -> 保持允许 (未创建独立用户)"
+    # 未验证的认证选项保持现状, 包括之前已关闭的密码/root 登录。
+    # 重跑时保留旧管理块里本轮没有重新决定的设置。
+    awk 'NR==FNR {keys[tolower($1)]=1; next}
+        $0 == "# BEGIN VPS-FIRST MANAGED" {managed=1; next}
+        $0 == "# END VPS-FIRST MANAGED" {managed=0; next}
+        managed && NF && !keys[tolower($1)] {print}' "$settings" "$SSHD_CONFIG" > "$tmp_dir/retained"
+    cat "$tmp_dir/retained" >> "$settings"
+    render_ssh_config "$SSHD_CONFIG" "$settings" "$candidate"
+    if ! ssh_syntax_check "$candidate"; then
+        error "候选 SSH 配置未通过语法检查, 原配置未修改"
+        return 0
     fi
-    echo "  公钥认证:        -> 开启"
-    echo "  密码登录:        -> $(if [[ "$SSH_KEY_CONFIGURED" == true ]]; then echo '禁用'; else echo '保持开启(安全起见)'; fi)"
-    echo "  最大认证尝试:    -> 3 次"
-    echo "  客户端超时:      -> 3600s x 2 (2小时)"
-    if command -v getenforce &>/dev/null && [[ "$(getenforce 2>/dev/null)" == "Enforcing" ]] && [[ "$NEW_SSH_PORT" != "22" ]]; then
-        echo "  SELinux 端口注册: -> $NEW_SSH_PORT"
+    local effective
+    effective=$(ssh_effective_config "${NEW_USER:-root}" "$candidate" "$new_port") || return 1
+    if [[ "$SSH_KEY_CONFIGURED" == true ]] &&
+       ! awk '$1=="passwordauthentication" && $2=="no" {p=1}
+             $1=="kbdinteractiveauthentication" && $2=="no" {k=1}
+             $1=="pubkeyauthentication" && $2=="yes" {a=1}
+             END {exit !(p && k && a)}' <<< "$effective"; then
+        warn "现有 Match/Include 规则覆盖了目标用户的认证设置, 本次 SSH 修改已跳过"
+        return 0
     fi
-    echo ""
-
-    if ! confirm "确认应用以上 SSH 配置?"; then
-        rm -f "$tmp_config"
-        warn "已跳过 SSH 配置修改"
-        NEW_SSH_PORT=$(get_current_ssh_port)
+    if [[ "$SUDO_VERIFIED" == true && -n "$NEW_USER" ]] &&
+       [[ "$(ssh_effective_config root "$candidate" "$new_port" | awk '$1=="permitrootlogin" {print $2}')" != no ]]; then
+        warn "现有 Match 规则覆盖了 root 登录限制, 本次 SSH 修改已跳过"
+        return 0
+    fi
+    info "将应用以下配置 (现有端口继续监听):"
+    cat "$settings"
+    if [[ "$new_port" != "$current_port" ]]; then
+        warn "请先在云安全组和已有系统防火墙放行 $new_port/tcp"
+        if ! confirm "新端口是否已放行?" "n"; then
+            warn "跳过 SSH 修改"
+            return 0
+        fi
+    fi
+    if ! confirm "确认应用以上 SSH 配置?" "n"; then
         return 0
     fi
 
-    cp "$tmp_config" "$sshd_config"
-    rm -f "$tmp_config"
-
-    # SELinux 处理 (必须在重启 SSH 之前)
-    handle_selinux_ssh
-
-    # 语法检查
-    if ssh_syntax_check; then
-        success "SSH 配置语法检查通过"
-    else
-        error "SSH 配置语法错误! 正在还原..."
-        cp "$sshd_backup" "$sshd_config"
-        error "已还原到备份配置"
-        NEW_SSH_PORT=$(get_current_ssh_port)
-        return 1
+    NEW_SSH_PORT="$new_port"
+    if ! handle_selinux_ssh; then
+        NEW_SSH_PORT="$current_port"
+        return 0
     fi
-
-    ssh_restart
-
-    echo ""
-    echo -e "${RED}${BOLD}╔══════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${RED}${BOLD}║         不 要 关 闭 当 前 终 端 !!!                     ║${NC}"
-    echo -e "${RED}${BOLD}╚══════════════════════════════════════════════════════════╝${NC}"
-    echo ""
-    echo -e "请 ${BOLD}新开一个终端窗口${NC}, 测试新的 SSH 配置:"
-    echo ""
-    local server_ip
-    server_ip=$(get_server_ip)
-    echo -e "  ${CYAN}ssh -p $NEW_SSH_PORT ${NEW_USER:-root}@${server_ip}${NC}"
-    if [[ "$SSH_KEY_CONFIGURED" != true ]]; then
-        echo "  (需要输入用户密码)"
+    cp -p "$SSHD_CONFIG" "$tmp_dir/original" || return 1
+    {
+        echo '#!/bin/bash'
+        printf 'dir=%q\nconfig=%q\nSSH_SERVICE=%q\n' "$tmp_dir" "$SSHD_CONFIG" "$SSH_SERVICE"
+        declare -f ssh_restart error
+        printf 'RED=%q\nNC=%q\n' "$RED" "$NC"
+        cat <<'EOF'
+if mv "$dir/pending" "$dir/rolling-back" 2>/dev/null; then
+    cp -p "$dir/original" "$config" && ssh_restart
+fi
+EOF
+    } > "$tmp_dir/rollback.sh"
+    start_rollback_guard "$tmp_dir" || return 1
+    if ! cat "$candidate" > "$SSHD_CONFIG" || ! ssh_syntax_check || ! ssh_restart; then
+        error "SSH 配置应用失败, 正在还原"
+        cancel_rollback_guard
+        NEW_SSH_PORT="$current_port"
+        return 0
     fi
-    echo ""
-
-    if confirm "新终端能成功登录吗?"; then
-        success "SSH 安全加固完成"
-    else
-        warn "登录失败! 正在还原 SSH 配置..."
-        cp "$sshd_backup" "$sshd_config"
-        ssh_restart
-        success "已还原到备份配置并重启 SSH"
-        NEW_SSH_PORT=$(get_current_ssh_port)
-        echo ""
-        echo "可能的原因:"
-        echo "  1. 防火墙/安全组未放行新端口"
-        echo "  2. 轻量服务器端口可能改不了 (平台代理 SSH)"
-        if command -v getenforce &>/dev/null; then
-            echo "  3. SELinux 阻止了新端口"
+    warn "不要关闭当前终端; 请新开终端测试实际登录"
+    echo "  ssh -o ControlMaster=no -o ControlPath=none -p $new_port ${NEW_USER:-root}@$(get_server_ip)"
+    if confirm "新终端登录和 sudo (非 root 用户) 均成功?" "n"; then
+        if finish_rollback_guard; then
+            success "SSH 加固完成; 原端口仍保留, 验证后可手动清理"
+        else
+            warn "已超过确认时间, SSH 配置已自动回滚"
+            NEW_SSH_PORT="$current_port"
         fi
-        echo ""
-        warn "请排查后重新运行脚本, 或手动修改 /etc/ssh/sshd_config"
+    else
+        cancel_rollback_guard
+        NEW_SSH_PORT="$current_port"
+        warn "SSH 配置已回滚"
     fi
 }
 
 # ========================== 阶段 5: 防火墙 ==========================
 phase5_firewall() {
-    step "阶段 5/7: 防火墙配置 ($FW_TYPE)"
-
-    # 检查防火墙工具是否可用, 不可用时尝试切换
-    case "$FW_TYPE" in
-        ufw)
-            if ! command -v ufw &>/dev/null; then
-                if command -v firewall-cmd &>/dev/null; then
-                    FW_TYPE="firewalld"
-                    warn "ufw 不可用, 切换到 firewalld"
-                else
-                    FW_TYPE="iptables"
-                    warn "ufw 不可用, 切换到 iptables"
-                fi
-            fi
-            ;;
-        firewalld)
-            if ! command -v firewall-cmd &>/dev/null; then
-                if command -v ufw &>/dev/null; then
-                    FW_TYPE="ufw"
-                    warn "firewalld 不可用, 切换到 ufw"
-                else
-                    FW_TYPE="iptables"
-                    warn "firewalld 不可用, 切换到 iptables"
-                fi
-            fi
-            ;;
-    esac
-
-    info "使用防火墙: $FW_TYPE"
-
-    if ! confirm "是否配置防火墙?"; then
-        info "跳过防火墙配置"
+    step "阶段 5/7: 防火墙配置"
+    # 优先使用已经运行的管理器, 避免叠加多套防火墙。
+    if firewall-cmd --state &>/dev/null; then
+        if LC_ALL=C ufw status 2>/dev/null | grep -q '^Status: active'; then
+            warn "ufw 与 firewalld 同时运行, 请先统一防火墙管理方式; 跳过自动修改"
+            return 0
+        fi
+        FW_TYPE=firewalld
+    elif LC_ALL=C ufw status 2>/dev/null | grep -q '^Status: active'; then
+        FW_TYPE=ufw
+    elif command -v ufw &>/dev/null; then
+        FW_TYPE=ufw
+    elif command -v firewall-cmd &>/dev/null; then
+        FW_TYPE=firewalld
+    elif command -v iptables &>/dev/null; then
+        FW_TYPE=iptables
+    else
+        warn "没有可用的防火墙工具, 跳过"
         return 0
     fi
-
-    info "设置默认策略: 拒绝入站, 允许出站"
-    fw_set_defaults
-
-    # SSH
-    info "放行 SSH 端口: $NEW_SSH_PORT/tcp"
-    fw_allow_port "$NEW_SSH_PORT" "tcp" "SSH"
-
-    if [[ "$NEW_SSH_PORT" != "22" ]]; then
-        if confirm "是否同时放行 22 端口? (推荐: 轻量服务器端口可能改不了)"; then
-            fw_allow_port "22" "tcp" "SSH-fallback"
-        fi
+    if [[ "$FW_TYPE" == iptables ]] && systemctl is-active --quiet nftables 2>/dev/null; then
+        warn "检测到独立 nftables 服务, 请在现有规则中配置; 跳过 iptables 修改"
+        return 0
+    fi
+    if [[ "$FW_TYPE" == iptables && -s /proc/net/if_inet6 ]] && ! command -v ip6tables &>/dev/null; then
+        warn "系统启用了 IPv6 但缺少 ip6tables, 跳过不完整的防火墙配置"
+        return 0
+    fi
+    info "使用防火墙: $FW_TYPE"
+    confirm "是否配置防火墙?" || return 0
+    if [[ "$FW_TYPE" == firewalld ]]; then
+        fw_prepare_zones || return 1
     fi
 
-    # HTTP/HTTPS
-    if confirm "是否放行 HTTP (80) 和 HTTPS (443) 端口?"; then
-        fw_allow_port "80" "tcp" "HTTP"
-        fw_allow_port "443" "tcp" "HTTPS"
+    local ports port extra_port proto
+    local rules=()
+    ports=$(get_configured_ssh_ports) || return 1
+    # 保留全部 sshd 端口和当前会话端口, 避免只保留一个猜测出的 22。
+    while IFS= read -r port; do
+        [[ -n "$port" ]] && rules+=("$port/tcp")
+    done < <(printf '%s\n%s\n%s\n' "$ports" "$(get_current_ssh_port)" "$NEW_SSH_PORT" |
+        awk 'NF && !seen[$1]++ {print $1}')
+    if confirm "是否放行 HTTP (80) 和 HTTPS (443) 端口?" "n"; then
+        rules+=(80/tcp 443/tcp)
     fi
-
-    # 自定义端口
     while confirm "是否需要放行其他端口?" "n"; do
-        local extra_port
-        read -rp "$(echo -e "${CYAN}请输入端口号: ${NC}")" extra_port
-        if [[ "$extra_port" =~ ^[0-9]+$ ]] && (( extra_port >= 1 && extra_port <= 65535 )); then
-            local proto
-            read -rp "$(echo -e "${CYAN}协议 [tcp/udp/both, 默认 tcp]: ${NC}")" proto
-            proto="${proto:-tcp}"
-            if [[ "$proto" == "both" ]]; then
-                fw_allow_port "$extra_port" "tcp"
-                fw_allow_port "$extra_port" "udp"
-            else
-                fw_allow_port "$extra_port" "$proto"
-            fi
-            success "已放行 $extra_port/$proto"
-        else
+        read -rp "请输入端口号: " extra_port
+        if ! validate_port "$extra_port" 1; then
             warn "端口号不合法, 跳过"
+            continue
+        fi
+        extra_port=$((10#$extra_port))
+        read -rp "协议 [tcp/udp/both, 默认 tcp]: " proto
+        proto="${proto:-tcp}"
+        case "$proto" in
+            tcp|udp) rules+=("$extra_port/$proto") ;;
+            both) rules+=("$extra_port/tcp" "$extra_port/udp") ;;
+            *) warn "协议不合法, 跳过" ;;
+        esac
+    done
+    info "将放行: ${rules[*]}"
+    info "现有放行规则会保留; firewalld 保留原 zone 策略"
+    confirm "确认应用并启用防火墙?" "n" || return 0
+
+    local backup rule failed=false
+    backup=$(mktemp -d /etc/vps-first-firewall.XXXXXX)
+    prepare_firewall_rollback "$backup" || return 1
+    start_rollback_guard "$backup" || return 1
+    for rule in "${rules[@]}"; do
+        if ! fw_allow_port "${rule%/*}" "${rule#*/}"; then
+            failed=true
+            break
         fi
     done
-
-    echo ""
-    warn "启用防火墙可能会中断现有连接 (SSH 端口已放行则不会)"
-    if confirm "确认启用防火墙?"; then
-        fw_enable
-        echo ""
-        fw_status
-        echo ""
-        success "防火墙已启用"
+    if "$failed" || ! fw_set_defaults || ! fw_enable; then
+        error "防火墙配置失败, 正在恢复之前的规则"
+        cancel_rollback_guard
+        return 0
+    fi
+    warn "请在新终端重新 SSH 登录, 确认网络正常"
+    echo "  ssh -o ControlMaster=no -o ControlPath=none -p ${NEW_SSH_PORT:-$(get_current_ssh_port)} ${NEW_USER:-root}@$(get_server_ip)"
+    if confirm "新终端连接是否成功?" "n"; then
+        if finish_rollback_guard; then
+            fw_persist || warn "开机持久化失败, 请检查防火墙服务"
+            fw_status || true
+            success "防火墙已应用"
+        else
+            warn "已超时, 防火墙已回滚"
+        fi
     else
-        warn "跳过防火墙启用"
+        cancel_rollback_guard
+        warn "防火墙已回滚"
     fi
 }
 
@@ -1297,7 +1340,7 @@ phase6_extras() {
         if ! confirm "是否重新配置 Swap?" "n"; then
             info "保持现有 Swap"
         else
-            _configure_swap "$total_mem"
+            _configure_swap "$total_mem" || warn "Swap 配置未完成"
         fi
     else
         warn "当前没有 Swap!"
@@ -1306,7 +1349,7 @@ phase6_extras() {
             warn "内存 <= 2GB, 强烈建议配置 Swap, 否则内存耗尽时进程会被直接杀掉"
         fi
         if confirm "是否配置 Swap?"; then
-            _configure_swap "$total_mem"
+            _configure_swap "$total_mem" || warn "Swap 配置未完成"
         fi
     fi
 
@@ -1339,23 +1382,21 @@ phase6_extras() {
     else
         info "当前拥塞控制算法: $current_cc"
         if confirm "是否开启 BBR 加速?"; then
-            _sysctl_set "net.core.default_qdisc" "fq"
-            _sysctl_set "net.ipv4.tcp_congestion_control" "bbr"
-            sysctl -p > /dev/null 2>&1
-
-            local new_cc
-            new_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-            if [[ "$new_cc" == "bbr" ]]; then
-                success "BBR 已成功开启"
+            modprobe tcp_bbr 2>/dev/null || true
+            if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+                if _sysctl_set net.ipv4.tcp_congestion_control bbr && _sysctl_set net.core.default_qdisc fq; then
+                    success "BBR 已开启"
+                else
+                    warn "BBR 配置未完全生效, 请检查当前内核和容器限制"
+                fi
             else
-                warn "BBR 开启可能需要重启后生效"
-                warn "当前内核 $(uname -r) 可能不支持 BBR (需要 4.9+)"
+                warn "当前内核未提供 BBR, 跳过"
             fi
         fi
     fi
 
     if confirm "是否应用内核网络调优参数? (优化 Web 服务器性能)" "n"; then
-        _configure_kernel_network
+        _configure_kernel_network || warn "部分连接队列参数未生效"
     fi
 
     # ======================================================================
@@ -1365,71 +1406,8 @@ phase6_extras() {
     if ! command -v fail2ban-client &>/dev/null; then
         warn "fail2ban 未安装, 跳过配置"
     elif confirm "是否配置 fail2ban?"; then
-        local jail_local="/etc/fail2ban/jail.local"
+        _configure_fail2ban || warn "fail2ban 配置未完成, 请检查上方错误"
 
-        if [ -f "$jail_local" ]; then
-            cp "$jail_local" "$jail_local.bak.$(date +%Y%m%d%H%M%S)"
-            info "已备份原配置"
-        fi
-
-        local f2b_maxretry f2b_bantime f2b_findtime
-        read -rp "$(echo -e "${CYAN}最大尝试次数 [默认: 3]: ${NC}")" f2b_maxretry
-        f2b_maxretry="${f2b_maxretry:-3}"
-        read -rp "$(echo -e "${CYAN}封禁时间(秒) [默认: 3600 即1小时]: ${NC}")" f2b_bantime
-        f2b_bantime="${f2b_bantime:-3600}"
-        read -rp "$(echo -e "${CYAN}检测窗口(秒) [默认: 600 即10分钟]: ${NC}")" f2b_findtime
-        f2b_findtime="${f2b_findtime:-600}"
-
-        # 实时探测 SSH 日志后端(Debian 12/Ubuntu 24.04+ 默认不再生成 /var/log/auth.log,
-        # 日志已完全迁移到 systemd-journald, 必须改用 backend=systemd)
-        local f2b_backend="$F2B_BACKEND"
-        local f2b_logpath="$F2B_LOGPATH"
-        if [[ "$f2b_logpath" == "/var/log/auth.log" && ! -f /var/log/auth.log ]]; then
-            if command -v journalctl &>/dev/null; then
-                info "未检测到 /var/log/auth.log, 改用 systemd journal"
-                f2b_backend="systemd"
-                f2b_logpath=""
-            fi
-        elif [[ "$f2b_logpath" == "/var/log/secure" && ! -f /var/log/secure ]]; then
-            info "未检测到 /var/log/secure, 改用 systemd journal"
-            f2b_backend="systemd"
-            f2b_logpath=""
-        fi
-
-        # backend=systemd 时 logpath 必须为空(或不写), 否则 fail2ban 会尝试打开不存在的文件
-        local logpath_line=""
-        if [[ -n "$f2b_logpath" ]]; then
-            logpath_line="logpath  = $f2b_logpath"
-        fi
-
-        cat > "$jail_local" <<JAILEOF
-[DEFAULT]
-bantime  = $f2b_bantime
-findtime = $f2b_findtime
-maxretry = $f2b_maxretry
-
-[sshd]
-enabled  = true
-port     = $NEW_SSH_PORT
-filter   = sshd
-backend  = $f2b_backend
-$logpath_line
-maxretry = $f2b_maxretry
-bantime  = $f2b_bantime
-findtime = $f2b_findtime
-JAILEOF
-
-        systemctl restart fail2ban 2>/dev/null || service fail2ban restart 2>/dev/null || rc-service fail2ban restart 2>/dev/null
-        systemctl enable fail2ban 2>/dev/null || true
-
-        # 等一会再检查是否启动成功, 失败时给出诊断
-        sleep 1
-        if systemctl is-active fail2ban &>/dev/null || service fail2ban status &>/dev/null 2>&1; then
-            success "fail2ban 已配置并启动 (backend=$f2b_backend)"
-            fail2ban-client status sshd 2>/dev/null || true
-        else
-            error "fail2ban 启动失败, 请运行 'systemctl status fail2ban' 和 'journalctl -u fail2ban -n 50' 查看详情"
-        fi
     fi
 
     # ======================================================================
@@ -1466,7 +1444,7 @@ JAILEOF
     # ======================================================================
     #  6.7 命令历史增强
     # ======================================================================
-    echo -e "\n${BOLD}[6.7 命令历史增强 (安全审计)]${NC}"
+    echo -e "\n${BOLD}[6.7 命令历史增强 (历史查询)]${NC}"
     echo "  增强后效果:"
     echo "    - 每条命令记录执行时间"
     echo "    - 历史记录保留 10000 条"
@@ -1481,75 +1459,128 @@ JAILEOF
     # ======================================================================
     echo -e "\n${BOLD}[6.8 自动安全更新]${NC}"
     if confirm "是否启用自动安全更新?" "n"; then
-        setup_auto_updates
+        setup_auto_updates || warn "自动更新配置未完成"
+    fi
+}
+
+# ---- fail2ban: 独立 drop-in, 不覆盖其他 jail ----
+_configure_fail2ban() {
+    local maxretry bantime findtime
+    read -rp "最大尝试次数 [默认: 3]: " maxretry
+    read -rp "封禁时间(秒) [默认: 3600]: " bantime
+    read -rp "检测窗口(秒) [默认: 600]: " findtime
+    maxretry="${maxretry:-3}"; bantime="${bantime:-3600}"; findtime="${findtime:-600}"
+    local value
+    for value in "$maxretry" "$bantime" "$findtime"; do
+        if [[ ! "$value" =~ ^[0-9]{1,8}$ ]] || (( 10#$value < 1 )); then
+            error "fail2ban 参数必须为正整数"
+            return 1
+        fi
+    done
+    local backend="$F2B_BACKEND" logpath="$F2B_LOGPATH" ports
+    if [[ -d /run/systemd/system ]] && [[ ! -f "$logpath" ]]; then
+        backend=systemd
+    fi
+    if [[ "$backend" != systemd && ! -f "$logpath" ]]; then
+        warn "找不到 SSH 日志 $logpath, 请先配置系统日志"
+        return 1
+    fi
+    ports=$(get_configured_ssh_ports | paste -sd, -) || return 1
+    local conf=/etc/fail2ban/jail.d/99-vps-first.local backup
+    mkdir -p /etc/fail2ban/jail.d
+    backup=$(mktemp -d /etc/fail2ban/.vps-first.XXXXXX) || return 1
+    if [[ -f "$conf" ]]; then cp -p "$conf" "$backup/original" || return 1; fi
+    {
+        echo '[sshd]'
+        echo 'enabled = true'
+        echo "port = $ports"
+        echo "backend = $backend"
+        [[ "$backend" == systemd ]] || echo "logpath = $logpath"
+        echo "maxretry = $((10#$maxretry))"
+        echo "bantime = $((10#$bantime))"
+        echo "findtime = $((10#$findtime))"
+    } > "$conf"
+    if ! fail2ban-client -t || ! restart_fail2ban; then
+        error "fail2ban 配置检查或启动失败, 还原本次 drop-in"
+        if [[ -f "$backup/original" ]]; then
+            cp -p "$backup/original" "$conf"
+        else
+            mv "$conf" "$backup/failed.local"
+        fi
+        restart_fail2ban || true
+        return 1
+    fi
+    if [[ -d /run/systemd/system ]]; then
+        systemctl enable fail2ban || return 1
+    elif command -v rc-update &>/dev/null; then
+        rc-update add fail2ban default || return 1
+    fi
+    success "fail2ban 已配置; 其他 jail 保持原样"
+}
+
+restart_fail2ban() {
+    if [[ -d /run/systemd/system ]]; then
+        systemctl restart fail2ban
+    elif command -v rc-service &>/dev/null; then
+        rc-service fail2ban restart
+    else
+        service fail2ban restart
     fi
 }
 
 # ---- Swap 配置实现 ----
-_configure_swap() {
-    local total_mem="$1"
-    local recommended_swap
-
-    # 推荐大小: <=1GB内存给2倍, 1-4GB给等量, >4GB给一半(但至少2G)
+_configure_swap() (
+    # 独立子 shell 的清理 trap 不覆盖 SSH/防火墙的回滚 trap。
+    local total_mem="$1" recommended_swap swap_size
+    [[ "$total_mem" =~ ^[0-9]+$ ]] && (( total_mem > 0 )) || return 1
     if (( total_mem <= 1024 )); then
-        recommended_swap=$(( total_mem * 2 ))
+        recommended_swap=$((total_mem * 2))
     elif (( total_mem <= 4096 )); then
         recommended_swap=$total_mem
     else
-        recommended_swap=$(( total_mem / 2 ))
-        (( recommended_swap < 2048 )) && recommended_swap=2048
+        recommended_swap=$((total_mem / 2))
     fi
-
-    local swap_size
-    read -rp "$(echo -e "${CYAN}Swap 大小(MB) [默认: ${recommended_swap}MB, 推荐物理内存 ${total_mem}MB 的 $(( recommended_swap * 100 / total_mem ))%]: ${NC}")" swap_size
-    swap_size="${swap_size:-$recommended_swap}"
-
-    if ! [[ "$swap_size" =~ ^[0-9]+$ ]] || (( swap_size < 256 )); then
-        warn "Swap 大小不合法 (最小 256MB), 跳过"
-        return 0
-    fi
-
+    (( recommended_swap < 256 )) && recommended_swap=256
     local swapfile="/swapfile"
-
-    # 如果已有 swap, 先关闭
-    if swapon --show 2>/dev/null | grep -q "$swapfile"; then
-        info "关闭旧的 $swapfile..."
-        swapoff "$swapfile" 2>/dev/null || true
-        rm -f "$swapfile"
-    fi
-
-    # 检查磁盘空间
-    local free_disk
-    free_disk=$(df -m / | awk 'NR==2{print $4}')
-    if (( swap_size > free_disk - 1024 )); then
-        error "磁盘剩余空间不足 (剩余 ${free_disk}MB, 需要至少 $(( swap_size + 1024 ))MB)"
+    if [[ -e "$swapfile" || -L "$swapfile" ]]; then
+        warn "$swapfile 已存在, 保留原文件; 调整大小请另行维护"
         return 0
     fi
-
-    info "正在创建 ${swap_size}MB Swap 文件..."
-
-    # dd 方式 (兼容性最好, fallocate 在某些文件系统上不支持 swap)
-    dd if=/dev/zero of="$swapfile" bs=1M count="$swap_size" status=progress 2>&1
-
-    chmod 600 "$swapfile"
-    mkswap "$swapfile" > /dev/null
-    swapon "$swapfile"
-
-    # 持久化到 fstab
-    if ! grep -q "$swapfile" /etc/fstab 2>/dev/null; then
-        echo "$swapfile none swap sw 0 0" >> /etc/fstab
+    read -rp "Swap 大小(MB) [默认: $recommended_swap]: " swap_size
+    swap_size="${swap_size:-$recommended_swap}"
+    if [[ ! "$swap_size" =~ ^[0-9]{1,8}$ ]] || (( 10#$swap_size < 256 )); then
+        warn "Swap 大小不合法 (最小 256MB)"
+        return 0
     fi
-
-    # swappiness: 低值=尽量用物理内存, 高值=积极用swap
-    local swappiness=10
-    _sysctl_set "vm.swappiness" "$swappiness"
-    # 减少 inode/dentry 缓存回收压力
-    _sysctl_set "vm.vfs_cache_pressure" "50"
-    sysctl -p > /dev/null 2>&1
-
-    success "Swap 配置完成: ${swap_size}MB (swappiness=$swappiness)"
-    free -h | grep -i swap
-}
+    swap_size=$((10#$swap_size))
+    local free_disk fs_type
+    free_disk=$(df -Pm / | awk 'NR==2 {print $4}')
+    if (( swap_size > free_disk - 1024 )); then
+        warn "磁盘空间不足, 创建后必须至少保留 1GB"
+        return 0
+    fi
+    fs_type=$(stat -f -c %T /)
+    case "$fs_type" in
+        ext2/ext3|xfs) ;;
+        *) warn "文件系统 $fs_type 需要单独确认 Swap 文件支持, 跳过自动创建"; return 0 ;;
+    esac
+    umask 077
+    (set -o noclobber; : > "$swapfile") || return 1
+    trap 'if ! awk '\''NR>1 && $1=="/swapfile" {found=1} END {exit !found}'\'' /proc/swaps; then rm -f /swapfile; fi' EXIT
+    # BusyBox dd 不支持 status=progress; 写入前文件已限制为 root 可读写。
+    if ! dd if=/dev/zero of="$swapfile" bs=1M count="$swap_size" ||
+       ! mkswap "$swapfile" || ! swapon "$swapfile"; then
+        error "Swap 创建/启用失败, 不写入 fstab"
+        return 1
+    fi
+    if ! awk '$1=="/swapfile" && $3=="swap" {found=1} END {exit !found}' /etc/fstab; then
+        cp -p /etc/fstab "/etc/fstab.bak.$(date +%Y%m%d%H%M%S)" || return 1
+        printf '\n/swapfile none swap sw 0 0\n' >> /etc/fstab || return 1
+    fi
+    _sysctl_set vm.swappiness 10 || true
+    _sysctl_set vm.vfs_cache_pressure 50 || true
+    success "Swap 已启用: ${swap_size}MB"
+)
 
 # ---- Locale 配置实现 ----
 _configure_locale() {
@@ -1560,7 +1591,7 @@ _configure_locale() {
             # 生成 locale
             if command -v locale-gen &>/dev/null; then
                 sed -i "s/^# *${target_locale}/${target_locale}/" /etc/locale.gen 2>/dev/null || true
-                echo "$target_locale UTF-8" >> /etc/locale.gen 2>/dev/null
+                grep -qxF "$target_locale UTF-8" /etc/locale.gen || echo "$target_locale UTF-8" >> /etc/locale.gen
                 locale-gen "$target_locale" 2>/dev/null || locale-gen 2>/dev/null
             fi
             update-locale LANG="$target_locale" 2>/dev/null || true
@@ -1596,61 +1627,30 @@ _configure_locale() {
 
 # ---- 内核网络调优实现 ----
 _configure_kernel_network() {
-    info "应用内核网络调优参数..."
-
-    # TCP 连接队列 (防止高并发时连接被丢弃)
-    _sysctl_set "net.core.somaxconn" "65535"
-    _sysctl_set "net.core.netdev_max_backlog" "65535"
-    _sysctl_set "net.ipv4.tcp_max_syn_backlog" "65535"
-
-    # TCP 快速回收与复用 (减少 TIME_WAIT 堆积)
-    _sysctl_set "net.ipv4.tcp_tw_reuse" "1"
-    _sysctl_set "net.ipv4.tcp_fin_timeout" "15"
-
-    # TCP keepalive (更快发现断连)
-    _sysctl_set "net.ipv4.tcp_keepalive_time" "600"
-    _sysctl_set "net.ipv4.tcp_keepalive_intvl" "30"
-    _sysctl_set "net.ipv4.tcp_keepalive_probes" "5"
-
-    # 文件描述符上限
-    _sysctl_set "fs.file-max" "1048576"
-
-    # TCP 内存与窗口 (提升吞吐)
-    _sysctl_set "net.core.rmem_max" "16777216"
-    _sysctl_set "net.core.wmem_max" "16777216"
-    _sysctl_set "net.ipv4.tcp_rmem" "4096 212992 16777216"
-    _sysctl_set "net.ipv4.tcp_wmem" "4096 212992 16777216"
-
-    # 开启 TCP Fast Open
-    _sysctl_set "net.ipv4.tcp_fastopen" "3"
-
-    # 本地端口范围 (防止高并发时端口耗尽)
-    _sysctl_set "net.ipv4.ip_local_port_range" "1024 65535"
-
-    sysctl -p > /dev/null 2>&1
-    success "内核网络调优完成"
-
-    echo "  主要调整:"
-    echo "    - TCP 连接队列:    65535"
-    echo "    - TIME_WAIT 复用:  开启"
-    echo "    - TCP Fast Open:   开启"
-    echo "    - 文件描述符上限:  1048576"
-    echo "    - 本地端口范围:    1024-65535"
+    info "调整连接队列; 实际收益取决于应用并发和内存, 建议先压测"
+    _sysctl_set net.core.somaxconn 4096 || return 1
+    _sysctl_set net.core.netdev_max_backlog 4096 || return 1
+    _sysctl_set net.ipv4.tcp_max_syn_backlog 4096 || return 1
+    success "连接队列参数已应用"
 }
 
-# ---- sysctl 写入工具 (避免重复追加) ----
+# ---- 只应用本次键, 不重载系统其他 sysctl 配置 ----
 _sysctl_set() {
-    local key="$1"
-    local value="$2"
-    local conf="/etc/sysctl.conf"
-
-    if grep -qE "^${key}\s*=" "$conf" 2>/dev/null; then
-        sed -i "s|^${key}\s*=.*|${key} = ${value}|" "$conf"
-    elif grep -qE "^#\s*${key}\s*=" "$conf" 2>/dev/null; then
-        sed -i "s|^#\s*${key}\s*=.*|${key} = ${value}|" "$conf"
-    else
-        echo "${key} = ${value}" >> "$conf"
+    local key="$1" value="$2" conf=/etc/sysctl.d/99-vps-first.conf
+    if ! sysctl -w "$key=$value" >/dev/null; then
+        warn "当前内核不支持或不允许修改 $key, 未写入持久配置"
+        return 1
     fi
+    mkdir -p /etc/sysctl.d
+    local tmp
+    tmp=$(mktemp /etc/sysctl.d/.vps-first.XXXXXX) || return 1
+    if [[ -f "$conf" ]]; then
+        cp -p "$conf" "${tmp}.backup" || return 1
+        awk -F= -v key="$key" '{name=$1; gsub(/^[[:space:]]+|[[:space:]]+$/, "", name); if(name!=key) print}' "$conf" > "$tmp"
+    fi
+    printf '%s = %s\n' "$key" "$value" >> "$tmp"
+    chmod 644 "$tmp"
+    mv "$tmp" "$conf"
 }
 
 # ---- Bash 历史记录增强实现 ----
@@ -1663,8 +1663,16 @@ export HISTTIMEFORMAT="%Y-%m-%d %H:%M:%S  "
 export HISTSIZE=10000
 export HISTFILESIZE=20000
 export HISTCONTROL=ignoredups:ignorespace
-shopt -s histappend 2>/dev/null
-export PROMPT_COMMAND="history -a; ${PROMPT_COMMAND:-}"
+# /etc/profile.d 也会被非 Bash shell 读取。
+if [ -n "${BASH_VERSION:-}" ]; then
+    shopt -s histappend
+    if ! declare -p PROMPT_COMMAND 2>/dev/null | grep -q 'declare -a'; then
+        case "${PROMPT_COMMAND:-}" in
+            *"history -a"*) ;;
+            *) PROMPT_COMMAND="history -a; ${PROMPT_COMMAND:-}" ;;
+        esac
+    fi
+fi
 HISTEOF
 
     chmod 644 "$history_conf"
@@ -1708,7 +1716,7 @@ phase7_summary() {
 
     # 2. 非 root 用户
     if [[ -n "${NEW_USER:-}" ]] && id "${NEW_USER}" &>/dev/null; then
-        _check_item "ok" "用户 '${NEW_USER}' (${SUDO_GROUP} 组)"
+        _check_item "ok" "用户 '${NEW_USER}' (sudo 已实测: $SUDO_VERIFIED)"
     elif [[ -z "${NEW_USER:-}" ]]; then
         _check_item "warn" "使用 root 登录 (未创建独立用户)"
     else
@@ -1717,7 +1725,7 @@ phase7_summary() {
 
     # 3. SSH 密钥
     local user_home
-    user_home=$(eval echo "~${NEW_USER:-root}")
+    user_home=$(get_user_home "${NEW_USER:-root}")
     local auth_file="$user_home/.ssh/authorized_keys"
     if [ -f "$auth_file" ] && [ -s "$auth_file" ]; then
         _check_item "ok" "SSH 公钥已配置"
@@ -1726,17 +1734,19 @@ phase7_summary() {
     fi
 
     # 4. 密码登录状态
-    local pass_auth
-    pass_auth=$(grep -E '^[ \t]*PasswordAuthentication[ \t]+' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | tail -1)
-    if [[ "$pass_auth" == "no" ]]; then
-        _check_item "ok" "密码登录已禁用"
+    local pass_auth kbd_auth effective
+    effective=$(ssh_effective_config) || return 1
+    pass_auth=$(awk '$1=="passwordauthentication" {print $2}' <<< "$effective")
+    kbd_auth=$(awk '$1=="kbdinteractiveauthentication" {print $2}' <<< "$effective")
+    if [[ "$pass_auth" == no && "$kbd_auth" == no ]]; then
+        _check_item "ok" "目标用户密码及交互认证已禁用"
     else
-        _check_item "warn" "密码登录仍开启$(if [[ "$SSH_KEY_CONFIGURED" != true ]]; then echo ' (密钥未验证, 安全保留)'; fi)"
+        _check_item "warn" "目标用户仍允许密码或交互认证"
     fi
 
     # 5. Root 登录
     local root_login
-    root_login=$(grep -E '^[ \t]*PermitRootLogin[ \t]+' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | tail -1)
+    root_login=$(ssh_effective_config root | awk '$1=="permitrootlogin" {print $2}')
     if [[ "$root_login" == "no" ]]; then
         _check_item "ok" "Root SSH 已禁止"
     else
@@ -1745,8 +1755,8 @@ phase7_summary() {
 
     # 6. SSH 端口
     local ssh_port
-    ssh_port=$(get_current_ssh_port)
-    _check_item "ok" "SSH 端口: $ssh_port"
+    ssh_port="${NEW_SSH_PORT:-$(get_current_ssh_port)}"
+    _check_item "ok" "SSH 配置端口: $(get_configured_ssh_ports | paste -sd, -) (运行端口需实测)"
 
     # 7. Swap
     local swap_total
@@ -1774,7 +1784,7 @@ phase7_summary() {
     fi
 
     # 10. fail2ban
-    if systemctl is-active fail2ban &>/dev/null || service fail2ban status &>/dev/null 2>&1; then
+    if fail2ban-client ping &>/dev/null; then
         _check_item "ok" "fail2ban 运行中"
     else
         _check_item "warn" "fail2ban 未运行"
@@ -1829,9 +1839,10 @@ phase7_summary() {
     echo -e "${BOLD}===== 关键文件 =====${NC}"
     echo ""
     echo "  SSH 配置:       /etc/ssh/sshd_config"
-    echo "  SSH 备份:       /etc/ssh/sshd_config.bak.*"
+    echo "  SSH 备份:       /etc/ssh/sshd_config.vps-first.*/original"
     echo "  授权密钥:       $user_home/.ssh/authorized_keys"
-    echo "  fail2ban:       /etc/fail2ban/jail.local"
+    echo "  fail2ban:       /etc/fail2ban/jail.d/99-vps-first.local"
+    echo "  内核参数:       /etc/sysctl.d/99-vps-first.conf"
 
     if check_reboot_required; then
         echo ""
@@ -1855,7 +1866,7 @@ phase_bonus_ssh_hello() {
     echo -e "项目地址: ${CYAN}https://github.com/maodeyu180/ssh_hello${NC}"
     echo ""
 
-    if ! confirm "是否安装 SSH 登录信息美化脚本?"; then
+    if ! confirm "是否下载并运行 GitHub 上的 SSH 登录美化脚本?" "n"; then
         info "跳过 ssh_hello 安装"
         return 0
     fi
@@ -1864,11 +1875,8 @@ phase_bonus_ssh_hello() {
     local tmp_script
     tmp_script=$(mktemp)
 
-    # 优先使用国内镜像
-    if curl -o "$tmp_script" -sSL --max-time 10 \
-        "https://ghfast.top/https://raw.githubusercontent.com/maodeyu180/ssh_hello/main/ssh_info.sh" 2>/dev/null; then
-        success "下载完成 (国内镜像)"
-    elif curl -o "$tmp_script" -sSL --max-time 15 \
+    # 使用项目原始 HTTPS 地址, HTTP 错误码不能当作脚本执行。
+    if curl -o "$tmp_script" -fsSL --max-time 15 \
         "https://raw.githubusercontent.com/maodeyu180/ssh_hello/main/ssh_info.sh" 2>/dev/null; then
         success "下载完成 (GitHub)"
     elif wget -qO "$tmp_script" --timeout=15 \
@@ -1882,7 +1890,7 @@ phase_bonus_ssh_hello() {
         return 0
     fi
 
-    if [ ! -s "$tmp_script" ]; then
+    if [[ ! -s "$tmp_script" ]] || ! bash -n "$tmp_script"; then
         error "下载文件为空, 跳过"
         rm -f "$tmp_script"
         return 0
@@ -1890,7 +1898,11 @@ phase_bonus_ssh_hello() {
 
     info "启动 ssh_hello 安装向导 (按提示输入自定义文本和颜色)..."
     echo ""
-    bash "$tmp_script"
+    if ! bash "$tmp_script"; then
+        rm -f "$tmp_script"
+        warn "ssh_hello 安装未完成"
+        return 0
+    fi
     rm -f "$tmp_script"
 
     echo ""
@@ -1899,7 +1911,12 @@ phase_bonus_ssh_hello() {
 
 # ========================== 主流程 ==========================
 main() {
-    clear
+    [[ "$EUID" -eq 0 ]] || { error "请以 root 身份运行: sudo bash $0"; return 1; }
+    [[ "$(uname -s)" == Linux ]] || { error "此脚本仅支持 Linux"; return 1; }
+    [[ "${BASH_VERSINFO[0]}" -ge 4 ]] || { error "需要 Bash 4 或更新版本"; return 1; }
+    [[ -t 0 ]] || { error "需要交互终端; 请下载后运行 bash vps-init.sh"; return 1; }
+    umask 022
+    clear 2>/dev/null || true
     echo -e "${BOLD}${CYAN}"
     echo "  ╔══════════════════════════════════════════════════╗"
     echo "  ║   VPS 安全初始化脚本 - 多发行版兼容 · 安全优先  ║"
@@ -1937,4 +1954,7 @@ main() {
     phase7_summary
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    set -euo pipefail
+    main "$@"
+fi

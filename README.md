@@ -1,237 +1,124 @@
-# VPS First —  VPS 到手后的第一个脚本
+# VPS First — VPS 初始化脚本
 
-> 新买的 VPS 就像一扇没上锁的门，全世界的脚本小子都在敲。这个脚本帮你把门锁好。
+交互式 Linux VPS 初始化脚本，包含系统更新、用户与 SSH 配置、防火墙、Swap、fail2ban 和常用环境设置。
 
-一个**安全优先、多发行版兼容**的 VPS 初始化脚本，覆盖从裸机到安全可用的完整流程。
+每个模块可以跳过。SSH 和防火墙修改会先备份，应用后要求新开终端验证；**180 秒内未确认、验证失败或脚本正常退出/收到中断信号时，会尝试回滚**。
 
-## 特性
+## 运行
 
-- **多发行版兼容** — Debian/Ubuntu、CentOS/RHEL/Fedora/AlmaLinux/Rocky、Arch、Alpine、openSUSE
-- **防锁定设计** — 禁用密码登录前强制验证密钥登录，SSH 配置修改失败自动回滚
-- **公钥格式校验** — 粘贴公钥时自动验证格式，防止无效密钥写入
-- **EOL 源自动修复** — CentOS/Debian/Ubuntu/Fedora EOL 后自动切换到对应归档源
-- **SELinux 自适应** — CentOS/RHEL 修改端口时自动处理 SELinux 策略
-- **防火墙自动选择** — 根据系统自动使用 ufw / firewalld / iptables
-- **全程可交互** — 每个步骤都可确认或跳过，不会强制执行
-
-## 执行流程
-
-```
-阶段 0  前置检查          → 系统检测、发行版识别、适配方案确认
-阶段 1  系统更新          → 软件包更新 + 基础工具安装 (+ EPEL 源)
-阶段 2  用户配置          → 可选创建非 root 用户 + sudo 权限
-阶段 3  SSH 密钥          → 公钥安装 + 格式校验 + ⚠️ 登录验证
-阶段 4  SSH 加固          → 改端口 / 禁 root / 禁密码 + ⚠️ 登录验证 + 自动回滚
-阶段 5  防火墙            → ufw / firewalld / iptables 自动选择
-阶段 6  系统优化          → 6.1 主机名
-                          → 6.2 Swap 虚拟内存 (自动推荐大小)
-                          → 6.3 Locale 语言环境
-                          → 6.4 BBR 加速 + 内核网络调优
-                          → 6.5 fail2ban 防暴力破解
-                          → 6.6 系统时区
-                          → 6.7 命令历史增强 (安全审计)
-                          → 6.8 自动安全更新
-附加    SSH Hello         → 可选安装 SSH 登录美化脚本
-阶段 7  总结              → 13 项检查清单 + 连接信息 + SSH Config 建议
-```
-
-## 快速开始
-
-### 一键运行（推荐）
-
-> **注意：** 请以 root 身份登录后执行。新 VPS 首次登录通常就是 root，直接粘贴即可。
-
-**海外服务器：**
+需要 Linux、Bash 4+、root 权限、已安装并能正常读取配置的 OpenSSH 服务端，以及交互终端。Alpine 极简镜像需要先安装 Bash。
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/maodeyu180/vps_first/main/vps-init.sh -o vps-init.sh && bash vps-init.sh
+curl -fsSL https://raw.githubusercontent.com/maodeyu180/vps_first/main/vps-init.sh -o vps-init.sh
+# 阅读脚本后执行
+sudo bash vps-init.sh
+# 已经是 root 时: bash vps-init.sh
 ```
 
-**国内服务器：**
-
-```bash
-curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/maodeyu180/vps_first/main/vps-init.sh -o vps-init.sh && bash vps-init.sh
-```
-
-### 手动下载运行
-
-```bash
-# 下载
-wget https://raw.githubusercontent.com/maodeyu180/vps_first/main/vps-init.sh
-
-# 添加执行权限
-chmod +x vps-init.sh
-
-# 以 root 身份运行（二选一）
-bash vps-init.sh          # 已经是 root
-sudo bash vps-init.sh     # 普通用户通过 sudo 提权
-```
-
-## 运行前准备
-
-你只需要准备一样东西：**SSH 公钥**。
-
-如果还没有，在你的**本地电脑**上生成：
+先在本地准备 SSH 公钥：
 
 ```bash
 ssh-keygen -t ed25519 -C "your@email.com"
-```
-
-然后查看公钥内容，脚本运行时需要粘贴：
-
-```bash
-# Linux / Mac
 cat ~/.ssh/id_ed25519.pub
-
-# Windows PowerShell
-cat $env:USERPROFILE\.ssh\id_ed25519.pub
-
-# Windows CMD
-type %USERPROFILE%\.ssh\id_ed25519.pub
 ```
 
-> 没有公钥也能运行，脚本会自动跳过密钥相关配置，并保持密码登录开启。
+Windows PowerShell 查看公钥：
 
-## 安全机制
-
-本脚本的核心原则是 **永远不锁死用户**：
-
-| 风险场景 | 保护措施 |
-|---------|---------|
-| 公钥粘贴错误 | 格式校验 (ed25519/rsa/ecdsa)，错误允许重试 3 次 |
-| 密钥登录不通 | 强制要求新开终端实测，失败则不禁用密码 |
-| SSH 配置写坏 | `sshd -t` 语法检查，失败自动回滚备份 |
-| 改端口后连不上 | 再次要求实测，失败自动还原并重启 SSH |
-| SELinux 阻拦 | 自动 `semanage` 注册端口 + `restorecon` 修复上下文 |
-| 防火墙锁端口 | 可选同时保留 22 端口作为 fallback |
-
-## 发行版兼容性
-
-| | Debian/Ubuntu | CentOS/RHEL | Fedora | Alma/Rocky | Arch | Alpine | openSUSE |
-|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| 包管理器 | apt | yum/dnf | dnf | dnf | pacman | apk | zypper |
-| 防火墙 | ufw | firewalld | firewalld | firewalld | iptables | iptables | firewalld |
-| sudo 组 | sudo | wheel | wheel | wheel | wheel | wheel | wheel |
-| SELinux | — | 自动处理 | 自动处理 | 自动处理 | — | — | — |
-| EPEL 源 | — | 自动安装 | 不需要 | 自动安装 | — | — | — |
-| 自动更新 | unattended-upgrades | dnf-automatic | dnf-automatic | dnf-automatic | 提示手动 | 提示手动 | YaST |
-
-## 各模块说明
-
-### Swap 虚拟内存
-
-根据物理内存自动推荐 Swap 大小：
-
-| 物理内存 | 推荐 Swap | 理由 |
-|---------|----------|------|
-| ≤ 1 GB | 2 倍内存 | 低配 VPS 必须有 Swap |
-| 1-4 GB | 等量 | 平衡方案 |
-| > 4 GB | 一半 (最小 2GB) | 大内存不需要太多 Swap |
-
-同时会设置 `swappiness=10`（尽量用物理内存）和 `vfs_cache_pressure=50`（减少缓存回收压力）。
-
-### 内核网络调优
-
-可选开启，适合跑 Web 服务 / 反向代理的 VPS：
-
-| 参数 | 值 | 作用 |
-|-----|-----|------|
-| `net.core.somaxconn` | 65535 | 增大 TCP 连接队列 |
-| `net.ipv4.tcp_tw_reuse` | 1 | 复用 TIME_WAIT 连接 |
-| `net.ipv4.tcp_fin_timeout` | 15 | 加快连接回收 |
-| `net.ipv4.tcp_fastopen` | 3 | 开启 TCP Fast Open |
-| `net.ipv4.ip_local_port_range` | 1024-65535 | 扩大可用端口范围 |
-| `fs.file-max` | 1048576 | 提高文件描述符上限 |
-
-### 命令历史增强
-
-为所有用户启用，每条命令记录执行时间，方便安全审计：
-
-```
-  496  2026-03-19 14:30:15  apt update
-  497  2026-03-19 14:31:02  systemctl restart nginx
+```powershell
+Get-Content $env:USERPROFILE\.ssh\id_ed25519.pub
 ```
 
-保留 10000 条历史记录，多终端同时写入不会互相覆盖。
+没有公钥也可以跳过配置，脚本会保留当前的认证设置。
 
-## 完成后你会得到
+## 执行流程
 
-脚本结束时会输出一份完整的检查清单和连接信息：
+| 阶段 | 内容 |
+|---|---|
+| 0 | 检测发行版、权限和现有 SSH 配置 |
+| 1 | 可选系统更新、EPEL 与基础工具安装 |
+| 2 | 可选创建普通用户，使用独立 sudoers 文件配置权限 |
+| 3 | OpenSSH 公钥解析校验、安装、实际密钥登录和 sudo 验证 |
+| 4 | SSH 配置预检、备份、应用、限时验证或回滚 |
+| 5 | 防火墙规则预览、备份、应用、限时验证或回滚 |
+| 6 | 主机名、Swap、Locale、BBR、连接队列、fail2ban、时区、Bash 历史、自动更新 |
+| 附加 | 可选从 GitHub 下载并执行 ssh_hello 安装脚本，默认跳过 |
+| 7 | 配置检查与连接信息 |
 
-```
-===== 系统检查清单 =====
+## SSH 处理原则
 
-  ✓ 主机名: my-vps
-  ✓ 用户 'deploy' (sudo 组)
-  ✓ SSH 公钥已配置
-  ✓ 密码登录已禁用
-  ✓ Root SSH 已禁止
-  ✓ SSH 端口: 22000
-  ✓ Swap: 2048MB
-  ✓ 防火墙已启用 (ufw)
-  ✓ BBR 加速已开启
-  ✓ fail2ban 运行中
-  ✓ 时区: Asia/Shanghai
-  ✓ Locale: en_US.UTF-8
-  ✓ 命令历史增强已配置
+- 密钥由 `ssh-keygen` 解析验证，拒绝只有合法外观、实际内容损坏的公钥。
+- 测试命令关闭连接复用、密码和交互认证，避免旧连接或其他认证方式造成误判。验证问题默认回答 **否**。
+- 只有确认密钥登录成功后，才禁用目标用户的密码及交互认证。
+- 只有独立用户的密钥登录和 `sudo -v` 均已确认成功，才设置禁止 root 登录。UID 0 账号不能作为独立管理员。
+- 没有完成验证时保留原认证配置，不会重新开启已禁用的密码登录。
+- 本脚本的设置写入主配置开头的标记块；保留用户现有 `Include` 和 `Match`。使用 `sshd -t` 检查语法、`sshd -T -C` 检查目标用户的配置；发现条件规则覆盖认证设置则跳过修改。
+- 修改端口采用**增加新端口、保留旧端口**的方式。验证稳定后再手动移除不需要的监听端口及防火墙规则。
+- 检测到 `ssh.socket` / `sshd.socket` 激活时，保留现有端口。socket 的监听配置需单独处理，不能只改 `sshd_config` 就假定生效。
+- SELinux 端口注册失败时跳过 SSH 修改，不会把其他服务的端口类型强行改成 SSH。
 
-得分: 13/13
+有关配置优先级和 socket 激活的说明见 [OpenSSH 手册](https://man.openbsd.org/sshd_config)及 [Ubuntu 官方说明](https://discourse.ubuntu.com/t/sshd-now-uses-socket-based-activation-ubuntu-22-10-and-later/30189)。
 
-===== 连接信息 =====
+### 回滚与恢复
 
-  登录命令:
-    ssh -p 22000 deploy@你的IP
+应用后必须保留当前终端，并在 **180 秒内**用新终端测试。超时回滚任务独立于交互输入运行；取消或读取输入失败也会触发回滚。
 
-===== 本地 SSH Config 建议 =====
+备份位置会在执行时打印：
 
-  Host my-vps
-      HostName 你的IP
-      User deploy
-      Port 22000
-      IdentityFile ~/.ssh/id_ed25519
-```
+| 修改 | 备份目录 | 原内容 |
+|---|---|---|
+| SSH | `/etc/ssh/sshd_config.vps-first.XXXXXX/` | `original` |
+| 防火墙 | `/etc/vps-first-firewall.XXXXXX/` | `original/` 或 `rules.v4`、`rules.v6` |
 
-## 附加功能：SSH Hello
+目录中保留 `rollback.sh`、确认状态和 `rollback.log`，便于排查。已经确认的事务不会被定时任务撤销。
 
-脚本最后会询问是否安装 [ssh_hello](https://github.com/maodeyu180/ssh_hello) — 一个 SSH 登录信息美化脚本。
+回滚不能覆盖机器断电、重启、所有相关进程被强制清理或备份恢复本身失败等情况。配置云安全组前应确认有控制台/VNC 入口；限时验证期间不要重启机器。
 
-安装后每次 SSH 连接会自动显示：
+## 防火墙
 
-- 自定义 ASCII 艺术字 Banner
-- 服务器状态（CPU / 内存 / 磁盘 / 负载 / 运行时间）
-- 连接信息（当前 IP / 上次登录 / 失败次数）
+优先沿用已经运行的 ufw/firewalld；发现两者同时运行时跳过自动修改。没有管理器时可使用 iptables；检测到独立 nftables 服务时跳过 iptables 修改。
 
-不需要的话直接跳过即可。
+- 所有规则先汇总展示，最终确认前不修改防火墙。
+- 放行 sshd 配置中的全部端口，以及当前会话和新验证的端口。
+- iptables 先添加 SSH、已建立连接、回环、ICMP/ICMPv6、DHCP 放行，再设置 INPUT DROP；不改 FORWARD 策略。
+- firewalld 使用默认和已绑定的 zone；服务未启动时用 `firewall-offline-cmd` 预配置。保留现有 zone 策略，不强制切换到 drop。
+- 现有放行规则会保留，不会自动关闭其他业务端口。HTTP/HTTPS 默认不开放。
+- Arch 与 Alpine 的 iptables 使用各自的持久化路径；其他发行版使用 iptables 回退时，会提示规则尚未配置开机恢复。
 
-## 常见问题
+firewalld 的 zone 含义见[官方说明](https://firewalld.org/documentation/man-pages/firewalld.zones)。云安全组、Docker 发布的端口和已有自定义防火墙策略仍需单独检查。
 
-### 轻量服务器改不了 SSH 端口？
+## Swap 与系统参数
 
-部分云厂商的轻量服务器 SSH 由平台代理，`sshd_config` 改端口不生效。脚本测试登录失败时会自动还原。其他安全措施（密钥登录 + 禁止 root + fail2ban）依然有效。
+没有 `/swapfile` 时，根据物理内存建议大小：≤1GB 使用两倍内存，1–4GB 使用等量，更大内存使用一半，最少 256MB。
 
-### fail2ban 把自己封了？
+- **已有 `/swapfile` 或同名符号链接时保留原文件**，不执行自动缩容、`swapoff` 或覆盖。
+- 自动创建仅用于 ext 系列/XFS；其他文件系统提示单独处理。
+- 创建后至少保留 1GB 磁盘空间；文件从开始写入时就限制为仅 root 可读写。
+- 成功启用后才写入 `/etc/fstab`；失败时清理本次新建且未启用的文件。
 
-用云控制台的 VNC 登录后执行：
+BBR 会先检查当前内核提供的算法。可选连接队列设置为 4096；需要结合业务压测判断收益，不统一更改 TIME_WAIT、TCP 超时、临时端口范围或文件句柄上限。
 
-```bash
-fail2ban-client set sshd unbanip 你的IP
-```
+参数写入 `/etc/sysctl.d/99-vps-first.conf`，按键去重，只应用当前参数。内核不支持或不允许修改的参数不会写入持久配置；不会执行 `sysctl -p` 重载其他配置。恢复时需同时恢复运行值和持久配置，单纯删除文件不会撤销当前运行值。
 
-### 重新运行脚本会冲突吗？
+## 其他配置
 
-不会。脚本会检测已存在的用户、已配置的 BBR、已有的公钥、已存在的 Swap 等，自动跳过或提示。SSH 配置和 fail2ban 配置修改前都会创建带时间戳的备份。sysctl 参数写入时会检查去重，不会重复追加。
+- **sudo**：使用 `/etc/sudoers.d/90-vps-first-用户名`，写入前后用 `visudo` 检查；不依赖发行版是否默认启用 wheel 组。
+- **fail2ban**：使用 `/etc/fail2ban/jail.d/99-vps-first.local`，仅配置 sshd jail，保留其他 jail；检查数字参数与配置语法，失败还原本次文件。
+- **Bash 历史**：可记录时间、增加容量、追加保存；不是不可篡改的安全审计。其他 shell 不会执行 Bash 的历史命令。
+- **系统更新**：Debian 使用普通升级，不自动 full-upgrade 或 autoremove。包管理器升级可能按发行版策略重启相关服务，应在合适的维护时间执行。
+- **EOL 系统**：仅提供归档源地址和修复说明。不会因网络请求失败就批量改写仓库，不会关闭全局软件源有效期检查。归档源不能恢复已停止的安全维护。
+- **自动安全更新**：默认关闭，支持的发行版按其更新工具配置；配置前备份已有文件。需要重启时仅提示，不主动重启机器。
 
-### Swap 应该设多大？
+## 适配与验证范围
 
-脚本会根据物理内存自动推荐。一般原则：**内存越小越需要 Swap**。512MB/1GB 的 VPS 不设 Swap 几乎必死（OOM Killer 会直接杀进程）。
+代码包含 Debian/Ubuntu、RHEL/CentOS/Fedora/AlmaLinux/Rocky、Arch、Alpine 和 openSUSE 分支。不同版本的软件包、服务管理器和云镜像配置有差异，分支存在不代表每个版本都经过真实 VPS 验证。
 
-### 内核调优参数安全吗？
+本次修改已通过 Bash 语法检查、ShellCheck，以及 Debian、Alpine 本地容器各 30 项回归测试。使用真实 OpenSSH 检查配置、公钥与 Include/Match 行为；防火墙、服务重载及 Swap 等危险操作使用替身测试，验证操作顺序、拒绝路径和回滚。
 
-这些都是常见的 Web 服务器生产环境参数，不会导致系统不稳定。如果需要还原，编辑 `/etc/sysctl.conf` 删除对应行后执行 `sysctl -p` 即可。
+容器测试不能代替真实远程登录、systemd socket、SELinux 或重启持久化验收。
 
 ## 相关项目
 
-- [ssh_hello](https://github.com/maodeyu180/ssh_hello) — SSH 登录信息美化脚本
+[ssh_hello](https://github.com/maodeyu180/ssh_hello)：可选 SSH 登录信息展示工具。
 
 ## License
 
